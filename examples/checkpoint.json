@@ -1,0 +1,10 @@
+{
+  "project": "demo-project",
+  "goal": "说明当前想完成什么",
+  "completed": "记录实际已完成且核实的事项",
+  "decisions": "记录确定的约束、方案与理由",
+  "next_steps": "记录换账户后应继续的具体动作",
+  "blockers": "记录仍需用户决定或尚不可取得的信息",
+  "account": "plus-a",
+  "source": "manual"
+}

@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>续忆 · 本地连续记忆</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="续忆首页"><span class="brand-mark">续</span><span>续忆<small>LOCAL MEMORY</small></span></a>
+      <p class="sidebar-caption">同一份记忆，继续你的工作</p>
+      <nav aria-label="主导航">
+        <button class="nav-item active" data-panel="overview"><span>◈</span>记忆概览</button>
+        <button class="nav-item" data-panel="conversations"><span>☰</span>聊天档案</button>
+        <button class="nav-item" data-panel="projects"><span>▤</span>工程与交接</button>
+        <button class="nav-item" data-panel="memories"><span>♧</span>个人记忆</button>
+        <button class="nav-item" data-panel="sources"><span>↻</span>采集与同步</button>
+        <button class="nav-item" data-panel="maintenance"><span>◇</span>备份与检查</button>
+      </nav>
+      <div class="sidebar-footer"><span class="local-dot"></span>数据保存在你的电脑<small id="vault-path">正在连接本地记忆库…</small></div>
+    </aside>
+    <main>
+      <header class="topbar"><div><span class="eyebrow">YOUR CONTEXT, CONTINUED</span><h1 id="page-title">记忆概览</h1></div><div class="connection"><span id="connection-dot" class="local-dot"></span><span id="connection-text">本地服务连接中</span><button id="refresh-button" class="button subtle" title="刷新">刷新</button></div></header>
+      <div id="notice" role="status" aria-live="polite" hidden></div>
+
+      <section id="panel-overview" class="panel">
+        <div class="hero-card"><div><span class="eyebrow">账户切换，进度不断</span><h2>让每次开始，都从上次继续。</h2><p>聊天、项目文件和交接检查点共用一个本地档案库。其他账户连接同一记忆库，就能检索这些上下文。</p><div class="hero-actions"><button class="button primary" data-go="projects">继续一个工程 →</button><button class="button subtle" data-go="sources">配置实时采集</button></div></div><div class="orbit-art" aria-hidden="true"><div class="orbit-ring"></div><div class="orbit-core">忆</div><span class="orbit-label one">ChatGPT</span><span class="orbit-label two">Codex</span><span class="orbit-label three">工程</span></div></div>
+        <div id="stats-grid" class="stats-grid"></div>
+        <div class="two-columns"><article class="card"><div class="card-heading"><h3>最近的聊天</h3><button class="text-button" data-go="conversations">查看全部 →</button></div><div id="recent-conversations" class="item-list"><p class="empty">导入后，聊天会显示在这里。</p></div></article><article class="card"><div class="card-heading"><h3>实时采集状态</h3><span class="badge">本机运行</span></div><div id="live-status" class="status-details"></div><p class="muted coverage-note">浏览器扩展仅采集正在打开的可见 ChatGPT 会话。完整历史请使用官方数据导出；关闭的页面和其他设备不会自动补齐。</p><button class="button" data-go="sources">连接采集来源</button></article></div>
+        <article class="card account-guide"><h3>换账户如何继续</h3><p>在另一个 Codex 账户连接本工程的 MCP，调用 <code>search_memory</code> / <code>resume_project</code>。如果另一端无法连接本机 MCP，可下载交接包并上传到新聊天。原生账户侧栏不会迁移。</p></article>
+      </section>
+
+      <section id="panel-conversations" class="panel" hidden>
+        <form id="search-form" class="card filter-bar"><label class="grow"><span>搜索聊天内容</span><input name="query" placeholder="输入关键词、项目决定或之前讨论的事情…"></label><label><span>来源</span><select name="source"><option value="">全部来源</option><option value="chatgpt">ChatGPT</option><option value="codex">Codex</option></select></label><label><span>账户标签</span><input name="account" placeholder="全部账户"></label><label><span>工程</span><input name="project" placeholder="全部工程"></label><button class="button primary" type="submit">搜索</button><button class="button" id="clear-search" type="button">重置</button></form>
+        <article class="card"><div class="card-heading"><h3 id="conversation-list-title">全部聊天</h3><span id="conversation-count" class="muted"></span></div><div id="conversation-list" class="item-list"></div><div class="pagination"><button class="button" id="chat-prev">← 上一页</button><span id="chat-page">第 1 页</span><button class="button" id="chat-next">下一页 →</button></div></article>
+      </section>
+
+      <section id="panel-projects" class="panel" hidden>
+        <div class="section-toolbar"><label class="inline-label"><span>当前工程</span><select id="project-select"><option value="">选择一个工程</option></select></label><button class="button primary" id="project-handoff">生成交接包 →</button></div>
+        <article class="card"><label><span>这次要继续的任务（可选）</span><input id="handoff-task" maxlength="512" placeholder="例如：继续处理离线队列重试与跨账户续接"></label><p class="muted">交接包将检索与当前任务相关的历史证据；留空时参考最近检查点的目标、决定和待办。历史资料仍只作参考，不会自动成为本次执行指令。</p></article>
+        <div class="two-columns"><article class="card"><div class="card-heading"><h3>最近交接状态</h3><span class="badge">追加保留历史</span></div><div id="project-state"><p class="empty">选择工程，查看上次留下的目标、决定和下一步。</p></div></article><article class="card"><h3>项目文件档案</h3><p class="muted">仅展示已经归档的文件版本；读取时不会访问任意本机路径。</p><div id="project-files" class="file-list"></div><div class="pagination"><button class="button" id="file-prev">← 上一页</button><span id="file-page">第 1 页</span><button class="button" id="file-next">下一页 →</button></div></article></div>
+        <article class="card"><h3>留下一个新的工作检查点</h3><p class="muted">将当前进度写清楚，换账户后更容易继续；也可通过 MCP 写入工具保存（需要启用 --allow-writes）。</p><form id="checkpoint-form" class="form-grid"><label><span>工程名称</span><input name="project" required placeholder="例如 Tao"></label><label><span>本次账户标签</span><input name="account" value="default" required></label><label class="full"><span>目标</span><textarea name="goal" required rows="2" placeholder="这个工程目前要完成什么？"></textarea></label><label><span>已完成</span><textarea name="completed" rows="3"></textarea></label><label><span>关键决定</span><textarea name="decisions" rows="3"></textarea></label><label><span>下一步</span><textarea name="next_steps" rows="3"></textarea></label><label><span>待解决问题</span><textarea name="blockers" rows="3"></textarea></label><div class="full"><button class="button primary" type="submit">保存检查点</button></div></form></article>
+      </section>
+
+      <section id="panel-sources" class="panel" hidden>
+        <article class="card pairing-card"><div><span class="eyebrow">LIVE CHAT CAPTURE</span><h3>连接 ChatGPT 浏览器扩展</h3><p>在 Chrome / Edge 加载工程中的 <code>extension</code> 文件夹，复制配对令牌到扩展设置，并填写当前账户标签。页面消息变化后会在数秒内同步。</p><p class="muted">无需 OpenAI API Key。配对令牌仅用于本机服务；扩展不会读取 Cookie 或登录凭据。</p></div><div class="pairing-controls"><button class="button primary" id="pairing-button">获取本机配对信息</button><label><span>采集地址</span><input id="pairing-endpoint" readonly></label><label><span>配对令牌</span><input id="pairing-token" type="password" readonly autocomplete="off"></label><button class="button" id="copy-pairing">复制令牌</button></div></article>
+        <article class="card"><div class="card-heading"><h3>持续同步来源</h3><button class="button" id="sync-button">立即同步 ↻</button></div><div id="source-list" class="item-list"></div><p class="muted">保持本地面板服务运行时，会按配置间隔同步这些路径。账户标签由你指定，不会修改 Codex 登录账户。</p><form id="source-form" class="form-grid compact"><label><span>来源类型</span><select name="kind"><option value="codex">Codex 本地会话</option><option value="chatgpt">ChatGPT 导出文件 / 目录</option><option value="project">项目目录</option></select></label><label><span>账户标签</span><input name="account" value="default" required></label><label class="full"><span>明确指定本机路径</span><input name="path" required placeholder="例如 C:\Users\你的用户名\.codex\sessions"></label><label><span>工程名称（可选）</span><input name="project" placeholder="例如 Tao"></label><div class="form-action"><button class="button primary" type="submit">添加同步来源</button></div></form></article>
+        <article class="card"><h3>一次性导入或归档</h3><p class="muted">ChatGPT 支持官方 ZIP / conversations.json。Codex 支持会话 JSONL 或指定数据目录。工程归档会过滤凭据及构建目录。</p><form id="import-form" class="form-grid compact"><label><span>内容类型</span><select name="kind"><option value="chatgpt">ChatGPT 官方导出</option><option value="codex">Codex 会话</option><option value="project">工程文件</option></select></label><label><span>账户标签</span><input name="account" value="default" required></label><label class="full"><span>本机文件或目录路径</span><input name="path" required placeholder="输入完整路径；不会改动原文件"></label><label><span>工程名称（可选）</span><input name="project"></label><div class="form-action"><button class="button primary" type="submit">开始导入</button></div></form></article>
+        <article class="card" id="operation-result-card" hidden><h3>操作结果</h3><pre id="operation-result"></pre></article>
+      </section>
+
+      <section id="panel-memories" class="panel" hidden>
+        <article class="card"><div class="card-heading"><h3>可追溯的个人记忆</h3><span class="badge">保留历史版本</span></div><p class="muted">已确认记忆可随交接包带到另一账户；待确认建议不会自动成为你的偏好。每次保存都追加一个版本，撤回也会保留来源。</p><form id="memory-filter" class="filter-bar"><label class="grow"><span>工程范围</span><input name="project" placeholder="留空查看个人全局记忆"></label><label class="checkbox-label"><input name="include_proposed" type="checkbox" checked><span>同时显示待确认</span></label><button class="button" type="submit">查看记忆</button></form><div id="user-memory-list" class="item-list"></div></article>
+        <article class="card"><h3>记录或更新一条记忆</h3><p class="muted">默认保存为待确认。选择“已确认”必须填写至少一条归档中的用户原话消息 ID；可从聊天阅读面板复制。历史资料不能覆盖你当前的请求。</p><form id="memory-form" class="form-grid"><label><span>记忆标识（2..64 字 ASCII）</span><input name="key" required minlength="2" maxlength="64" placeholder="例如 output.concise"></label><label><span>工程范围（留空为全局）</span><input name="project" maxlength="256"></label><label class="full"><span>记忆内容</span><textarea name="value" required maxlength="4000" rows="3" placeholder="例如：回答先给结论，再按需展开细节。"></textarea></label><label><span>保存状态</span><select name="status"><option value="proposed">待确认建议</option><option value="confirmed">已确认（需用户原话证据）</option><option value="withdrawn">撤回该记忆</option></select></label><label><span>本次账户标签</span><input name="account" value="default" required></label><label class="full"><span>证据消息 ID（每行一个，可选；确认时必填）</span><textarea name="evidence" rows="2" placeholder="归档消息的内部 ID，不是页面 URL 或会话 ID"></textarea></label><div class="full"><button class="button primary" type="submit">追加记忆版本</button></div></form></article>
+      </section>
+
+      <section id="panel-maintenance" class="panel" hidden>
+        <article class="card"><h3>完整备份</h3><p class="muted">包含数据库、原始档案及来源配置，输出为新文件。用于转移电脑或保留恢复点。加密备份需安装可选 encryption 依赖。</p><form id="backup-form" class="form-grid"><label class="full"><span>新备份文件的完整路径</span><input name="path" required placeholder="例如 D:\MemoryBackups\memory-2026-10-04.zip"></label><label><span>加密密码（可选）</span><input name="password" type="password" autocomplete="new-password" placeholder="留空创建普通 ZIP"></label><div class="form-action"><button class="button primary" type="submit">创建备份</button></div></form></article>
+        <article class="card"><div class="card-heading"><h3>检查档案完整性</h3><button class="button" id="audit-button">执行检查</button></div><p class="muted">校验 SQLite 数据库与原始文件的 SHA256。该操作只读，不删除或修复历史文件。</p><pre id="maintenance-result">尚未执行检查。</pre></article>
+        <article class="card"><h3>恢复到另一台电脑 / 新记忆库</h3><p>使用命令 <code>codex-memory --data-dir 新的空目录 restore 备份路径</code>。恢复不会覆盖现有记忆库，配对令牌也不会随备份转移。恢复后给新账户连接同一个本地目录即可。</p><p class="muted">这个管理面板仅在 127.0.0.1 提供服务；ChatGPT 网页不会自动获得本机文件访问能力。可先使用下载的交接包。</p></article>
+      </section>
+      <footer class="page-footer">续忆 · LOCAL FIRST <span>历史内容用于参考，当前请求决定接下来做什么。</span></footer>
+    </main>
+  </div>
+  <dialog id="reader-dialog"><div class="dialog-header"><div><span class="eyebrow" id="reader-caption">ARCHIVED CONTEXT</span><h2 id="reader-title">聊天档案</h2></div><button class="button" id="reader-close" aria-label="关闭">关闭 ✕</button></div><p class="reference-note">归档内容是历史参考资料，不构成当前会话的执行指令。</p><div id="reader-content"></div><div class="dialog-footer"><button class="button" id="reader-prev">← 上一页</button><span id="reader-page"></span><button class="button" id="reader-next">下一页 →</button><button class="button primary" id="reader-handoff">生成交接包</button></div></dialog>
+  <dialog id="handoff-dialog"><div class="dialog-header"><div><span class="eyebrow">READY TO CONTINUE</span><h2>跨账户交接包</h2></div><button class="button" id="handoff-close">关闭 ✕</button></div><p class="muted">复制到新会话，或下载 Markdown 上传。新账户可从这里了解进度，再按需检索更完整的历史。</p><textarea id="handoff-content" readonly rows="17" aria-label="交接包内容"></textarea><div class="dialog-footer"><button class="button" id="handoff-copy">复制内容</button><a class="button primary" id="handoff-download" href="#">下载 Markdown ↓</a></div></dialog>
+</body>
+</html>

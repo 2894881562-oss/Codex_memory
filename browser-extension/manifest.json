@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Codex Memory Local — ChatGPT 实时归档",
+  "version": "0.1.0",
+  "description": "仅将已打开 ChatGPT 页面的可见消息保存到配对的本地记忆库；不读取登录凭据。",
+  "permissions": ["storage", "alarms", "clipboardWrite"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {"service_worker": "worker.js"},
+  "content_scripts": [{"matches": ["https://chatgpt.com/*"], "js": ["content.js"], "run_at": "document_idle"}],
+  "action": {"default_popup": "popup.html", "default_title": "本地记忆归档状态"},
+  "options_page": "options.html"
+}

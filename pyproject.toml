@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-memory-local"
+version = "0.2.0"
+description = "Local-first ChatGPT and Codex archive, search, checkpoints, and MCP"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.26,<2"]
+encryption = ["cryptography>=46,<48"]
+dev = ["ruff>=0.14,<1", "build>=1.2,<2", "setuptools>=68", "wheel"]
+all = ["mcp>=1.26,<2", "cryptography>=46,<48"]
+
+[project.scripts]
+codex-memory = "codex_memory.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+codex_memory = ["web/*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]

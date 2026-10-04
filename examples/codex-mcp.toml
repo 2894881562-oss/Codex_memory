@@ -1,0 +1,9 @@
+# Copy this block through your Codex MCP settings after reviewing it.
+# Replace paths if you move the application or use a different vault.
+# This example does not modify ~/.codex/config.toml automatically.
+[mcp_servers.local_memory]
+command = 'D:\Codex\Codex_memory\.venv\Scripts\python.exe'
+args = ['-m', 'codex_memory', '--data-dir', 'D:\Codex\Codex_memory\data', 'mcp']
+
+# For opt-in checkpoint writes only, append '--allow-writes' to args.
+# Reuse the SAME data-dir for each client/account that should share memory.

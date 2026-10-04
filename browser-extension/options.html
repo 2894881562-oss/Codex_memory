@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>本地归档设置</title><link rel="stylesheet" href="style.css"></head>
+<body class="options"><main><h1>ChatGPT 本地实时归档</h1>
+<p>只观察已打开聊天中已渲染的消息。不会读取历史后台接口、Cookie、密码或账户令牌。</p>
+<form id="settings">
+<label>本地服务端口<input name="port" type="number" min="1024" max="65535" value="8765" required></label>
+<label>配对令牌<input name="token" type="password" autocomplete="off" required placeholder="从本地仪表盘的浏览器配对区域复制"></label>
+<label>当前账户标签<input name="account" required maxlength="128" placeholder="例如 plus-a（不必填写邮箱）"></label>
+<label>项目 / 主题名称（普通聊天建议 personal）<input name="project" maxlength="128" value="personal" placeholder="例如 Tao 或 personal"></label>
+<label class="checkbox"><input name="enabled" type="checkbox">启用实时归档</label>
+<p>切换 ChatGPT 登录账户前，请暂停归档并更换账户标签，然后打开目标聊天。标签由你指定，不会自动读取登录身份。</p>
+<button type="submit">保存设置</button> <span id="notice" role="status"></span>
+</form>
+<p>令牌仅用于这份本地记忆库；不是 OpenAI API Key。扩展离线队列最多 100 批 / 6 MB，断开时保留并重试。离线流式回复会合并为最新可见版本。</p>
+<p>完整历史请另行导入 ChatGPT 官方导出。临时聊天、关闭页面、未渲染消息、手机和桌面客户端不在浏览器扩展覆盖范围。</p>
+</main><script src="options.js"></script></body></html>

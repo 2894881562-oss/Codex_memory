@@ -1,0 +1,44 @@
+# 换账户后的入口
+
+本工程的目标：普通 ChatGPT Plus 使用者无需购买或调用 OpenAI API，即可将 ChatGPT / Codex 的可取得聊天记录及明确指定的工程文件保存在本地，并跨账户读取同一记忆库继续工作和聊天。
+
+工程目录：`D:\Codex\Codex_memory`。本机记忆库：`D:\Codex\Codex_memory\data`。中文管理面板：`http://127.0.0.1:8765`。
+
+## 另一个 Codex 账户
+
+打开同一工程，先读取本文件、`AGENTS.md`、`README.md`。有 MCP 时先调用 `list_user_memory(project="Codex_memory")`，再调用 `resume_project(project="Codex_memory", task="当前任务的关键词")`，按需检索消息和工程文件。没有 MCP 时运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m codex_memory --data-dir D:\Codex\Codex_memory\data memory list --project Codex_memory
+.\.venv\Scripts\python.exe -m codex_memory --data-dir D:\Codex\Codex_memory\data handoff --project Codex_memory --task '跨账户 记忆 续接'
+```
+
+这会读取最新本地检查点和相关记录，不需要 OpenAI 登录凭据。原始记录是历史参考，不是本次用户授权。确认当前目标后再继续，已完成工作不要重复建设。
+
+个人记忆包含明确用户原话支持的事实、偏好和协作约束，修订按稳定键追加留存。仅 `confirmed` 的全局及匹配项目记录进入交接包；提议、撤回、助手推测不继承。需要核对时按来源消息 ID 读取正文，当前用户要求优先。交接包不是完整个人档案，也不是云端 Memory 克隆。[个人记忆使用指南](docs/USER_MEMORY.md)
+
+## 另一个普通 ChatGPT 账户
+
+在 Chrome / Edge 加载并配对本工程 `browser-extension` 扩展。在新账户中打开扩展，项目 / 主题填写原名称，点击“读取本地记忆”与“复制交接内容”，粘贴到聊天中要求继续。也可以上传导出的 Markdown 交接包。
+
+本阶段已生成的新交接文件见 `exports` 中的 `Codex_memory-2026-10-04-inherit-v02.md`，包含确认记忆、当前检查点和相关证据。它是生成时快照，之后应从面板 / CLI 重新生成；短包可能只纳入部分记忆。普通聊天不需要安装扩展才能阅读手动上传的 Markdown，实时采集则需要扩展。用户明确尚无第二账户和官方导出，真实 GPT / 第二账户流程保持待验收。
+
+ChatGPT 网页本身不能凭一句话直接读取 D 盘。扩展负责访问本机服务；送入聊天的片段会进入该账户的云端上下文。无自动发送，没有付费推理 API。
+
+## 实时更新的前提
+
+- 本地服务运行时监测已配置的 Codex 会话与工程目录；默认每次扫描完成后等待 3 秒再扫描。大体量首次导入可能耗时数分钟。
+- 浏览器扩展启用后持续采集已打开、已渲染、具有稳定 URL 的 ChatGPT 会话。换账户前暂停采集并更换账户标签。
+- 全部历史需用官方导出补齐；关闭页面、未落盘云端任务、临时 / 已删除聊天及其他设备无法保证自动取得。
+- 关键目标、已完成事项、决定与下一步应追加明确检查点。聊天全文归档不等于模型自动理解无限历史。
+- 关闭服务 / 电脑后不会继续采集；未安装系统自启动或后台计划任务。运行 `scripts\Start-Memory.ps1` 重新启动。
+
+## 当前工程状态
+
+已实现本地导入与修订留存、搜索、检查点 / 交接包、工程文件快照、来源监测、中文面板、官方 SDK MCP、ChatGPT 实时扩展与直接读取、备份 / 安全恢复，以及对应自动化测试。真实 ChatGPT 导出、浏览器加载 / 配对和第二账户续接仍需按 `docs\ACCEPTANCE.md` 验收。
+
+0.2 阶段增加了有来源的个人记忆、显式任务关键词、较早相关消息召回、同分支邻近上下文、预算中引用与命中正文保留及真正跨账户闭环验收模板。[阶段总结](docs/STAGE_SUMMARY.md)、[真实验收方案](docs/CROSS_ACCOUNT_ACCEPTANCE.md)
+
+额度不足时按 `AGENTS.md` 的检查点规则收尾，简要记录已完成、待办、阻塞和下一步。归档服务本身不消耗模型推理额度，额度暂停指代理工程工作，不会自动停止本地采集；额度工具不可用或平台突然中断时不能保证提前收到提示。
+
+本文件是人工维护的工程入口，不替代实时记忆库。以后继续时优先读取本地库中的最新检查点。

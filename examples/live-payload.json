@@ -1,0 +1,12 @@
+{
+  "source": "chatgpt",
+  "account": "plus-a",
+  "project": "demo-project",
+  "conversation_id": "demo-conversation-0001",
+  "title": "跨账户续接示例（非真实聊天）",
+  "messages": [
+    {"id": "demo-user-message-1", "role": "user", "text": "继续工程最近的检查点。"},
+    {"id": "demo-assistant-message-1", "role": "assistant", "text": "请提供检查点或调用本地记忆读取工具。"}
+  ],
+  "metadata": {"capture": "example", "incomplete_coverage": true}
+}
