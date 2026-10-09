@@ -292,6 +292,45 @@ class UserMemoryTests(unittest.TestCase):
         self.assertNotIn("PROPOSED_ONLY_MARKER", handoff)
         self.assertNotIn("WITHDRAWN_ONLY_MARKER", handoff)
 
+    def test_short_handoff_prioritizes_task_memory_and_reports_omitted_keys(self):
+        for index in range(8):
+            self._confirmed(f"aaa_unrelated_{index}", "无关天气记录" * 50, project="ProjectA")
+        relevant = self._confirmed("zzz_backup", "备份先核对 SHA256", project="ProjectA")
+        self._save("pending_backup", "备份 PENDING_VALUE", project="ProjectA")
+        self._save("withdrawn_backup", "备份 WITHDRAWN_VALUE", project="ProjectA", status="withdrawn")
+        self._confirmed("other_backup", "备份 OTHER_PROJECT_VALUE", project="ProjectB")
+        checkpoint = self.service.create_checkpoint(
+            "ProjectA",
+            "备份恢复",
+            completed="已完成本地索引",
+            decisions="只读核对",
+            next_steps="核对哈希",
+            blockers="缺真实导出",
+        )
+        for budget in (1000, 1500, 3500):
+            with self.subTest(budget=budget):
+                text = self.service.handoff(project="ProjectA", task="备份", max_chars=budget)
+                self.assertIn("备份先核对 SHA256", text)
+                self.assertIn(relevant["id"], text)
+                self.assertIn(self.evidence["user-evidence-a"], text)
+                self.assertIn("预算省略键", text)
+                self.assertIn(checkpoint["id"], text)
+                for marker in ("只读核对", "核对哈希", "缺真实导出"):
+                    self.assertIn(marker, text)
+                for marker in ("PENDING_VALUE", "WITHDRAWN_VALUE", "OTHER_PROJECT_VALUE"):
+                    self.assertNotIn(marker, text)
+                self.assertLessEqual(len(text), budget)
+
+    def test_short_handoff_global_matching_memory_can_outrank_unrelated_project(self):
+        self._confirmed("aaa_project", "天气偏好" * 100, project="ProjectA")
+        record = self._confirmed("zzz_global", "账户切换先确认上下文")
+        text = self.service.handoff(project="ProjectA", task="账户", max_chars=1000)
+        self.assertIn("账户切换先确认上下文", text)
+        self.assertIn(record["id"], text)
+        self.assertIn("全局记忆", text)
+        self.assertIn("预算省略键", text)
+        self.assertLessEqual(len(text), 1000)
+
     def test_memory_key_is_not_a_filesystem_path(self):
         for key in ("../outside", "../../outside", r"..\outside", "/outside", r"C:\outside"):
             with self.subTest(key=key), self.assertRaises(ValueError):

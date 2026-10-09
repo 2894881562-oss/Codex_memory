@@ -15,7 +15,7 @@ The product archives and reuses context across accounts; it does not recreate Op
 All return JSON-serializable dict/list/string, unless stated. Each operation opens its own SQLite connection (thread safe). `data_dir` property is an absolute Path. `db_path` points at `<data_dir>/memory.sqlite3`.
 
 - `initialize() -> dict`: schema/version/status; idempotent.
-- `stats() -> dict`: conversations, messages, artifacts, projects, checkpoints, accounts, db_path.
+- `stats() -> dict`: conversations, messages, artifacts, projects, checkpoints, accounts, db_path. Additive `conversation_sources` and `chatgpt_archive` distinguish latest ingestion from latest export diagnostics; coverage is limited to supplied files and does not imply cloud-account completeness. HTTP adds current server `runtime`, `sync` and `live` state.
 - `import_chatgpt(path, account="default", project="") -> dict`: report.
 - `import_codex(path=None, account="default", project="") -> dict`: default Path.home()/'.codex', report.
 - `list_conversations(source="", account="", project="", limit=50, offset=0) -> list[dict]`: rows include id (internal stable key), title, source, account, project, updated_at, message_count.
@@ -25,8 +25,10 @@ All return JSON-serializable dict/list/string, unless stated. Each operation ope
 - `list_projects() -> list[dict]`: name, conversation_count, checkpoint_count, updated_at.
 - `create_checkpoint(project, goal, completed="", decisions="", next_steps="", blockers="", account="default", source="manual") -> dict`: append only; returns id and supplied fields.
 - `project_state(project) -> dict`: latest checkpoint, related conversations, counts.
-- `handoff(project="", conversation_id="", max_chars=16000) -> str`: compact Markdown containing checkpoint, selected recent messages with source citations, references and explicit untrusted-data framing. At least one selector required.
-- `export_handoff(path, project="", conversation_id="", max_chars=16000) -> dict`: exclusive creation (no overwrite), returns path, chars.
+- `list_user_memory(project="", include_proposed=False, limit=100) -> list[dict]`: latest global and exactly matched project records, confirmed by default; at most 100 entries. Proposed/withdrawn revisions do not fall back to older confirmed values.
+- `save_user_memory(key, value, project="", status="proposed", evidence=None, account="default") -> dict`: append an explicit memory revision. Confirmed entries require existing archived user-message IDs; no automatic biography or inference.
+- `handoff(project="", conversation_id="", max_chars=16000, *, task="") -> str`: bounded Markdown with latest checkpoint, task-related confirmed memories, historical evidence and source citations. Literal ranking, visible omissions and untrusted-data framing; at least one selector required. Task is at most 512 characters and is not saved as a preference.
+- `export_handoff(path, project="", conversation_id="", max_chars=16000, *, task="") -> dict`: exclusive creation (no overwrite), returns path, chars.
 - `configure_source(kind, path, account="default", project="") -> dict`: append/update managed source in local store (`kind` = codex/chatgpt/project); never store credentials.
 - `list_sources() -> list[dict]`: id, kind, path, account, project, last_run, last_report.
 - `sync_sources() -> list[dict]`: idempotent scan of configured sources.
@@ -48,6 +50,8 @@ Restored managed-source paths are historical, not current authorization. Restore
 
 ## UI/security boundary
 
+0.3 ChatGPT import reports add `conversations_seen`, `messages_seen`, `warnings_omitted` and bounded `coverage`. Seen counts describe parsed input, not newly inserted rows. Coverage is `complete`, `partial` or `no_chat_history` for `provided_export_only`, with file/attachment counters. External pointers are never downloaded. Ignored non-history members may increment `skipped` without being a chat-history loss; actual rejected or unsupported content is warned. Warning output has at most 200 items including an omission notice; raw originals remain separate.
+
 Bind only 127.0.0.1 by default; validate Host and Origin; restrict writes to local authenticated session with CSRF token. Serve static assets from fixed package paths, escape imported strings. Never expose arbitrary file reads/raw artifacts through network tools. Import paths are selected explicitly by local user via CLI or authenticated dashboard. No telemetry. MCP stdio is account-independent; HTTP is loopback only and not publicly deployed. Checkpoint mutation is opt-in (`--allow-writes`); do not expose arbitrary imports/backups/file writes as MCP tools.
 
 Tests use unittest and tempfile.mkdtemp without recursive cleanup. Agent tests own unique files `tests/test_importers.py`, `tests/test_interfaces.py`; root owns core tests. Do not delete generated test directories.
@@ -59,5 +63,7 @@ The browser extension (Manifest V3 Chrome/Edge) observes only opened chatgpt.com
 HTTP: `/api/live` POST with `Authorization: Bearer <collector-token>`; collector token persisted in data_dir, never query URL; only extension Origin `chrome-extension://...` or missing Origin with valid bearer accepted. Dashboard token/CSRF is separate. `/api/pairing` GET dashboard authenticated returns collector token for user copying to extension. Browser extension saves token with chrome.storage.local and never reads cookies. Responses never contain raw archive. `/api/live` body at most 5 MB. Other dashboard route design owned by interface agent.
 
 `/api/resume` POST accepts the same collector bearer and `{project, conversation_id?, max_chars?}`; returns `{handoff}`. The extension uses storage/alarms/clipboardWrite to let the user explicitly read and copy a bounded local handoff, even with capture paused. It never injects or sends the handoff into a ChatGPT chat automatically. This direct path does not require MCP availability on the Plus account.
+
+`/api/collector/status` POST uses the same collector Origin/Bearer boundary and an empty JSON object. It returns only current connectivity, package version, server start/check timestamps, bounded last-live labels/time and DOM-only coverage, without synchronizing sources or returning conversations, raw archives or tokens. Historical success is not current reachability. Account-label changes require pause and keep old queued labels; page captures must match the current manual label and a local random `capture_epoch`. A label change remains paused until the user confirms the target account and refreshes the page. Copy/download actions require local preview confirmation, not automatic cloud submission.
 
 MCP also exposes archived project file list/fetch and `resume_project`; read operations share same account-independent vault, checkpoint save only explicit allow-writes. No automatic merge of native OpenAI sidebars.

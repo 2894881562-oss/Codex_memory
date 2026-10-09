@@ -8,6 +8,11 @@
   let scheduledAt = 0;
   let running = false;
   let rerun = false;
+  // Bind each loaded page to the manually selected account. Changing labels must
+  // not rearchive an old account's still-open DOM under the new identity.
+  const boundSettings = chrome.storage.local.get("settings").then(({settings = {}}) => ({
+    account: settings.account || "", capture_epoch: settings.capture_epoch || ""
+  }));
 
   function conversationId() {
     // Includes custom-GPT /g/<slug>/c/<uuid> routes, but never temporary/home views.
@@ -63,16 +68,20 @@
       if (id !== lastConversation) { seen.clear(); lastConversation = id; }
       const {settings = {}} = await chrome.storage.local.get("settings");
       if (!settings.enabled || !settings.token || !settings.account) return;
-      const messages = collect().filter(message => seen.get(message.id) !== `${message.role}\n${message.text}`);
+      const bound = await boundSettings;
+      if (bound.account !== settings.account || bound.capture_epoch !== (settings.capture_epoch || "")) return;
+      const rendered = collect();
+      const messages = rendered.filter(message => seen.get(message.id) !== `${message.role}\n${message.text}`);
       for (let offset = 0; offset < messages.length; offset += 200) {
         const batch = messages.slice(offset, offset + 200);
         const payload = {
-          source: "chatgpt", account: settings.account, project: settings.project || "",
+          source: "chatgpt", account: settings.account, project: settings.project || "", capture_epoch: settings.capture_epoch || "",
           conversation_id: id, title: document.title.replace(/\s*[-|]\s*ChatGPT\s*$/i, ""),
           messages: batch,
           metadata: {
             url: `${location.origin}${location.pathname}`, capture: "rendered-dom",
             observed_at: new Date().toISOString(), incomplete_coverage: true,
+            rendered_messages: rendered.length,
             fallback_message_ids: batch.some(message => message.id.startsWith("dom:"))
           }
         };
@@ -83,7 +92,7 @@
     } catch (error) {
       // Extension reload can invalidate this isolated script; no retries outside
       // the extension transport, and no application page changes.
-      if (!String(error).includes("Extension context invalidated")) console.debug("Local archive capture unavailable", String(error));
+      if (!String(error).includes("Extension context invalidated")) console.debug("Local archive capture unavailable; check extension status");
     } finally {
       running = false;
       if (rerun) { rerun = false; schedule(); }

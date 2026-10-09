@@ -118,6 +118,75 @@ def _score(text: str, terms: dict[str, float], role: str = "") -> float:
     )
 
 
+def rank_memories(memories: list[dict], terms: dict[str, float]) -> list[dict]:
+    """Prioritize literal task/checkpoint matches, never establish new facts.
+
+    The caller supplies the already validated global/exact-project records.
+    Account labels and cited message IDs are not relevance signals. Keep the
+    established deterministic scope/key order for ties and empty anchors.
+    """
+    return sorted(
+        (memory for memory in memories if memory["status"] == "confirmed"),
+        key=lambda memory: (
+            -_score(memory["key"] + "\n" + memory["value"], terms),
+            bool(memory["project"]),
+            memory["key"],
+            memory["id"],
+        ),
+    )
+
+
+def memory_context(memories: list[dict], terms: dict[str, float], max_chars: int) -> str:
+    """A bounded memory section with full source IDs and visible omissions.
+
+    Reserve the omission report before adding values, and choose source windows
+    near matching terms rather than silently losing a late match in a long
+    confirmed value. This remains keyword selection, not semantic inference.
+    """
+    ordered = rank_memories(memories, terms)
+    if not ordered:
+        return ""
+    heading = "## 个人记忆（用户原话有来源；当前要求优先）"
+    report_cap = min(240, max(70, max_chars // 3))
+    remaining = max_chars - len(heading) - 4 - report_cap
+    blocks, selected, shortened = [], set(), []
+    for memory in ordered:
+        scope = "项目" if memory["project"] else "全局"
+        header = f"[{memory['key']} | {scope}记忆 {memory['id']}]\n"
+        cite = "\n用户消息来源：" + ",".join(memory["evidence"][:2])
+        cap = min(600, remaining)
+        marker = "[记忆摘要截断]"
+        value_cap = cap - len(header) - len(cite)
+        if value_cap < len(marker) + 12:
+            # A long key must not consume the budget or hide a smaller record.
+            continue
+        value = memory["value"]
+        if len(value) > value_cap:
+            window, _ = excerpt(value, terms, value_cap - len(marker))
+            value = window + marker
+            shortened.append(memory["key"])
+        body = header + value + cite
+        blocks.append(body)
+        selected.add(memory["id"])
+        remaining -= len(body) + 2
+
+    omitted = [memory["key"] for memory in ordered if memory["id"] not in selected]
+    report = f"本包纳入 {len(selected)}/{len(ordered)} 条确认记忆。"
+    if shortened:
+        report += f"{len(shortened)} 条值已截断。"
+    if omitted:
+        report += "预算省略键（部分）：" + "、".join(omitted)
+    else:
+        report += "无省略键。"
+    suffix = "；完整值/来源请 list_user_memory（最多100条），提议/撤回不继承。"
+    available = report_cap - len(suffix)
+    if len(report) > available:
+        marker = "[键清单截断]"
+        report = report[: max(0, available - len(marker))] + marker
+    report += suffix
+    return "\n\n".join([heading, *blocks, report])
+
+
 def select_evidence(
     con: sqlite3.Connection,
     terms: dict[str, float],

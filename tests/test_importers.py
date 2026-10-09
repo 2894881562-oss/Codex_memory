@@ -5,6 +5,7 @@ import stat
 import tempfile
 import unittest
 import zipfile
+from hashlib import sha256
 from pathlib import Path
 from unittest.mock import patch
 
@@ -86,6 +87,10 @@ class ImporterTests(unittest.TestCase):
         self.assertTrue(conv.messages[2].metadata["current_node"])
         self.assertEqual(batch.artifacts[0][1], original)
         self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(batch.warnings, [])
+        self.assertEqual(batch.warnings_omitted, 0)
+        self.assertEqual(batch.coverage["status"], "complete")
+        self.assertEqual(batch.coverage["scope"], "provided_export_only")
 
     def test_chatgpt_tool_and_multimodal_references_are_truthful(self):
         conv = self.conversation()
@@ -184,6 +189,335 @@ class ImporterTests(unittest.TestCase):
         self.assertEqual(len(batch.artifacts), 2)
         self.assertEqual(len(batch.conversations), 1)
         self.assertFalse(any(b"NEVER" in blob for _, blob, _ in batch.artifacts))
+
+    def test_chatgpt_shards_and_attachment_associations_in_zip_and_directory(self):
+        records = {}
+        for number, filename in (
+            (10, "conversations_10.json"),
+            (2, "conversations_2.json"),
+            (1, "conversations-1.json"),
+            (0, "conversations.json"),
+        ):
+            conv = self.conversation()
+            conv["id"] = f"chat-{number}"
+            message = conv["mapping"]["user-node"]["message"]
+            if number == 0:
+                message["content"]["parts"].append({"asset_pointer": "file-service://file-photo"})
+                message["metadata"] = {
+                    "attachments": [{"id": "upload-opaque", "name": "attachments/report.pdf"}]
+                }
+            elif number == 1:
+                message["content"]["parts"].append({"file_url": "attachments/a/duplicate.pdf"})
+            elif number == 2:
+                message["content"]["parts"].append({"file_url": "duplicate.pdf"})
+            else:
+                message["content"]["parts"].extend(
+                    [
+                        {"image_url": "https://example.invalid/file-photo.png"},
+                        {"asset_pointer": "file-service://file-missing"},
+                    ]
+                )
+            records[f"bundle/{filename}"] = json.dumps(
+                {"conversations": [conv]} if number == 2 else conv if number == 10 else [conv]
+            ).encode()
+        records.update(
+            {
+                "bundle/file-photo.png": b"PNG fixture",
+                "bundle/attachments/report.pdf": b"PDF fixture",
+                "bundle/attachments/a/duplicate.pdf": b"first duplicate",
+                "bundle/attachments/b/duplicate.pdf": b"second duplicate",
+                # Even attachment JSON with a chat-like shape is not a shard.
+                "bundle/attachments/other.json": json.dumps([self.conversation()]).encode(),
+                "bundle/conversations-final.json": json.dumps([self.conversation()]).encode(),
+                "bundle/conversations-1-extra.json": json.dumps([self.conversation()]).encode(),
+                "bundle/auth.json": b"SYNTHETIC_CREDENTIAL_NOT_READ",
+            }
+        )
+        batches = []
+        for kind in ("zip", "directory"):
+            with self.subTest(kind=kind):
+                if kind == "zip":
+                    source = self.root / "sharded.zip"
+                    with zipfile.ZipFile(source, "w") as archive:
+                        for name, blob in records.items():
+                            archive.writestr(name, blob)
+                else:
+                    source = self.root / "directory-export"
+                    for name, blob in records.items():
+                        destination = source / name
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        destination.write_bytes(blob)
+                batch = importers.parse_chatgpt(source, "plus-a", "project")
+                batches.append(batch)
+                self.assertEqual(
+                    [conv.id for conv in batch.conversations], ["chat-0", "chat-1", "chat-2", "chat-10"]
+                )
+                self.assertEqual(batch.coverage["scope"], "provided_export_only")
+                self.assertEqual(batch.coverage["status"], "partial")
+                self.assertEqual(batch.coverage["chat_files_found"], 4)
+                self.assertEqual(batch.coverage["chat_files_parsed"], 4)
+                self.assertEqual(batch.coverage["chat_files_unsupported"], 0)
+                self.assertEqual(batch.coverage["attachments_available"], 5)
+                self.assertEqual(batch.coverage["attachments_matched"], 3)
+                self.assertEqual(batch.coverage["attachments_missing"], 1)
+                self.assertEqual(batch.coverage["attachments_ambiguous"], 1)
+                self.assertEqual(batch.coverage["attachments_external"], 1)
+                links = {
+                    link["reference"]: link
+                    for conv in batch.conversations
+                    for message in conv.messages
+                    for link in message.metadata["attachment_links"]
+                }
+                photo = links["file-service://file-photo"]
+                self.assertEqual(photo["artifact"], "chatgpt/bundle/file-photo.png")
+                self.assertEqual(photo["sha256"], sha256(b"PNG fixture").hexdigest())
+                self.assertEqual(links["upload-opaque"]["artifact"], "chatgpt/bundle/attachments/report.pdf")
+                qualified = links["attachments/a/duplicate.pdf"]
+                self.assertEqual(qualified["artifact"], "chatgpt/bundle/attachments/a/duplicate.pdf")
+                for reference, status in (
+                    ("duplicate.pdf", "ambiguous"),
+                    ("file-service://file-missing", "missing"),
+                    ("https://example.invalid/file-photo.png", "external"),
+                ):
+                    self.assertEqual(links[reference]["status"], status)
+                    self.assertNotIn("artifact", links[reference])
+                    self.assertNotIn("sha256", links[reference])
+                self.assertTrue(any("match multiple" in warning for warning in batch.warnings))
+                self.assertFalse(any("conversations-final.json" in name for name, _, _ in batch.artifacts))
+                for name, blob, _ in batch.artifacts:
+                    self.assertEqual(blob, records[name.removeprefix("chatgpt/")])
+        self.assertEqual(batches[0].coverage, batches[1].coverage)
+
+    def test_shard_order_is_natural_and_independent_of_zip_member_order(self):
+        members = []
+        for filename in (
+            "conversations_10.json",
+            "conversations-2.json",
+            "conversations_01.json",
+            "conversations-1.json",
+            "conversations.json",
+        ):
+            conv = self.conversation()
+            conv["id"] = filename
+            members.append((filename, json.dumps([conv])))
+        expected = [
+            "conversations.json",
+            "conversations-1.json",
+            "conversations_01.json",
+            "conversations-2.json",
+            "conversations_10.json",
+        ]
+        for index, entries in enumerate((members, list(reversed(members)))):
+            source = self.root / f"order-{index}.zip"
+            with zipfile.ZipFile(source, "w") as archive:
+                for name, body in entries:
+                    archive.writestr(name, body)
+            batch = importers.parse_chatgpt(source, "a")
+            self.assertEqual([conv.id for conv in batch.conversations], expected)
+            self.assertEqual(batch.coverage["status"], "complete")
+
+    def test_empty_and_unrecognized_chat_bodies_are_not_silent_success(self):
+        for index, (value, parsed) in enumerate(
+            (
+                ([], 1),
+                ({"conversations": []}, 1),
+                ([{"title": "not a chat", "content": "unrelated data"}], 0),
+                ({"mapping": "not an object"}, 0),
+                ({"messages": "not a list"}, 0),
+            )
+        ):
+            with self.subTest(value=value):
+                source = self.json_file(value, f"empty-{index}.json")
+                original = source.read_bytes()
+                batch = importers.parse_chatgpt(source, "a")
+                self.assertEqual(batch.conversations, [])
+                self.assertEqual(batch.artifacts[0][1], original)
+                self.assertEqual(batch.coverage["status"], "no_chat_history")
+                self.assertEqual(batch.coverage["chat_files_found"], 1)
+                self.assertEqual(batch.coverage["chat_files_parsed"], parsed)
+                self.assertEqual(batch.coverage["chat_files_unsupported"], 1 - parsed)
+                self.assertTrue(
+                    any("No recognizable ChatGPT message history" in warning for warning in batch.warnings)
+                )
+
+    def test_directory_with_only_attachments_reports_no_history(self):
+        self.json_file([self.conversation()], "attachments/not-history.json")
+        (self.root / "photo.png").write_bytes(b"synthetic attachment")
+        batch = importers.parse_chatgpt(self.root, "a")
+        self.assertEqual(len(batch.artifacts), 2)
+        self.assertEqual(batch.conversations, [])
+        self.assertEqual(batch.coverage["chat_files_found"], 0)
+        self.assertEqual(batch.coverage["attachments_available"], 2)
+        self.assertEqual(batch.coverage["status"], "no_chat_history")
+
+    def test_only_explicit_ascii_numeric_history_names_are_selected(self):
+        for index, filename in enumerate(
+            (
+                "conversations-final.json",
+                "conversations-1-extra.json",
+                "conversations--1.json",
+                "conversations-١.json",
+                "converſations-1.json",
+                "attachments/arbitrary.json",
+            )
+        ):
+            conv = self.conversation()
+            conv["id"] = f"unselected-{index}"
+            self.json_file([conv], filename)
+        selected = self.conversation()
+        selected["id"] = "selected"
+        self.json_file([selected], "CONVERSATIONS_001.JSON")
+        batch = importers.parse_chatgpt(self.root, "a")
+        self.assertEqual([conv.id for conv in batch.conversations], ["selected"])
+        self.assertEqual(batch.coverage["chat_files_found"], 1)
+        self.assertEqual(batch.coverage["status"], "complete")
+
+    def test_archive_root_and_conversation_relative_paths_do_not_hide_ambiguity(self):
+        conv = self.conversation()
+        conv["mapping"]["user-node"]["message"]["content"]["parts"].append(
+            {"file_url": "attachments/report.pdf"}
+        )
+        self.json_file([conv], "bundle/conversations.json")
+        for name in ("attachments/report.pdf", "bundle/attachments/report.pdf"):
+            destination = self.root / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(name.encode())
+        batch = importers.parse_chatgpt(self.root, "a")
+        link = batch.conversations[0].messages[0].metadata["attachment_links"][0]
+        self.assertEqual(link["status"], "ambiguous")
+        self.assertEqual(link["candidate_count"], 2)
+        self.assertNotIn("artifact", link)
+        self.assertEqual(batch.coverage["attachments_ambiguous"], 1)
+        self.assertEqual(batch.coverage["status"], "partial")
+
+    def test_mixed_supported_and_unknown_records_warn_without_guessing(self):
+        source = self.json_file([{"id": "unrelated", "title": "data"}, self.conversation(), None])
+        batch = importers.parse_chatgpt(source, "a")
+        self.assertEqual([conv.id for conv in batch.conversations], ["chat-id"])
+        self.assertEqual(batch.skipped, 2)
+        self.assertEqual(batch.coverage["chat_files_parsed"], 1)
+        self.assertEqual(batch.coverage["status"], "partial")
+
+    def test_attachment_filename_alias_collision_and_conflicting_name_are_not_guessed(self):
+        conv = self.conversation()
+        message = conv["mapping"]["user-node"]["message"]
+        message["content"]["parts"].extend(
+            [
+                {"asset_pointer": "file-service://file-photo"},
+                {"file_url": "file-photo.png"},
+                {"file_url": "wrong-folder/file-photo.png"},
+            ]
+        )
+        message["metadata"] = {
+            "attachments": [
+                {"id": "file-other", "name": "different.pdf"},
+                {"id": ["malformed untrusted ID"], "name": "not used.pdf"},
+            ]
+        }
+        self.json_file([conv])
+        for name in ("file-photo.png", "file-photo-duplicate.jpg", "file-other.png", "different.pdf"):
+            (self.root / name).write_bytes(name.encode())
+        batch = importers.parse_chatgpt(self.root, "a")
+        links = {
+            link["reference"]: link
+            for link in batch.conversations[0].messages[0].metadata["attachment_links"]
+        }
+        self.assertEqual(links["file-service://file-photo"]["status"], "ambiguous")
+        self.assertEqual(links["file-other"]["status"], "ambiguous")
+        self.assertEqual(links["file-photo.png"]["status"], "matched")
+        self.assertEqual(links["wrong-folder/file-photo.png"]["status"], "missing")
+        self.assertEqual(batch.coverage["status"], "partial")
+
+    def test_attachment_links_survive_bounded_message_metadata(self):
+        conv = self.conversation()
+        message = conv["mapping"]["user-node"]["message"]
+        message["metadata"] = {"huge": "汉" * 100000}
+        message["content"]["parts"].append({"asset_pointer": "file-service://file-photo"})
+        self.json_file([conv])
+        (self.root / "file-photo.png").write_bytes(b"exact PNG bytes")
+        batch = importers.parse_chatgpt(self.root, "a")
+        metadata = batch.conversations[0].messages[0].metadata
+        self.assertTrue(metadata["raw_truncated"])
+        self.assertEqual(metadata["attachment_links"][0]["artifact"], "chatgpt/file-photo.png")
+        self.assertEqual(metadata["attachment_links"][0]["sha256"], sha256(b"exact PNG bytes").hexdigest())
+        self.assertLessEqual(len(json.dumps(metadata).encode()), importers.MAX_METADATA_BYTES)
+        self.assertEqual(batch.coverage["attachments_matched"], 1)
+
+    def test_warning_limit_counts_omissions_and_keeps_coverage_outside_warnings(self):
+        source = self.json_file([{"not-chat": index} for index in range(8)])
+        with patch.object(importers, "MAX_WARNINGS", 3):
+            batch = importers.parse_chatgpt(source, "a")
+        self.assertEqual(len(batch.warnings), 3)
+        # Eight record warnings, unsupported file, and no history warning.
+        self.assertEqual(batch.warnings_omitted, 7)
+        self.assertEqual(batch.coverage["status"], "no_chat_history")
+        self.assertEqual(batch.coverage["chat_files_unsupported"], 1)
+        long_warning = importers.ImportBatch()
+        importers._warn(long_warning, "x" * 5000)
+        self.assertEqual(len(long_warning.warnings[0]), importers.MAX_WARNING_CHARS)
+        self.assertTrue(long_warning.warnings[0].endswith("[warning truncated]"))
+        self.assertEqual(long_warning.warnings_omitted, 0)
+
+    def test_reference_inspection_limit_marks_partial_without_losing_raw(self):
+        conv = self.conversation()
+        message = conv["mapping"]["user-node"]["message"]
+        message["content"]["parts"].extend({"file_id": f"file-{i}"} for i in range(5))
+        source = self.json_file([conv])
+        original = source.read_bytes()
+        with patch.object(importers, "MAX_REFERENCES", 2):
+            batch = importers.parse_chatgpt(source, "a")
+        self.assertEqual(batch.coverage["references_truncated"], 1)
+        self.assertEqual(batch.coverage["attachments_missing"], 2)
+        self.assertEqual(batch.coverage["status"], "partial")
+        self.assertEqual(batch.artifacts[0][1], original)
+        self.assertTrue(any("per-message limit" in warning for warning in batch.warnings))
+
+    def test_attachment_hint_entry_budget_bounds_actual_inspection(self):
+        reads = {"id": 0, "name": 0}
+
+        class CountedAttachment(dict):
+            def get(self, key, default=None):
+                if key in reads:
+                    reads[key] += 1
+                return super().get(key, default)
+
+        attachments = [CountedAttachment(id="file-repeat", name="repeat.pdf") for _ in range(30)]
+        message = {"metadata": {"attachments": attachments}}
+        with patch.object(importers, "MAX_REFERENCE_NODES", 5):
+            hints, truncated = importers._attachment_hints(message)
+        self.assertEqual(hints, {"file-repeat": ("repeat.pdf",)})
+        self.assertTrue(truncated)
+        # Repeated IDs still consume a budget, not 30 reads or 30*ref-count reads.
+        self.assertEqual(reads, {"id": 5, "name": 5})
+        with patch.object(importers, "MAX_REFERENCES", 2):
+            hints, truncated = importers._attachment_hints(
+                {"attachments": [{"id": f"file-{i}", "name": f"name-{i}.pdf"} for i in range(4)]}
+            )
+        self.assertTrue(truncated)
+        self.assertEqual(len(hints), 2)
+        with patch.object(importers, "MAX_REFERENCES", 2):
+            hints, truncated = importers._attachment_hints(
+                {"attachments": [{"id": "same-id", "name": f"name-{i}.pdf"} for i in range(4)]}
+            )
+        self.assertTrue(truncated)
+        self.assertEqual(len(hints["same-id"]), 2)
+
+    def test_hint_index_is_built_once_per_message_and_double_limits_count_once(self):
+        conv = self.conversation()
+        conv["mapping"]["user-node"]["message"]["metadata"] = {
+            "attachments": [{"id": "file-repeat", "name": "repeat.pdf"} for _ in range(60)]
+        }
+        source = self.json_file([conv])
+        with (
+            patch.object(importers, "MAX_REFERENCE_NODES", 40),
+            patch.object(importers, "_attachment_hints", wraps=importers._attachment_hints) as builder,
+        ):
+            batch = importers.parse_chatgpt(source, "a")
+        self.assertEqual(builder.call_count, 3)
+        self.assertEqual(batch.coverage["references_truncated"], 1)
+        self.assertEqual(batch.coverage["status"], "partial")
+        self.assertEqual(batch.artifacts[0][1], source.read_bytes())
+        self.assertEqual(sum("inspection reached" in warning for warning in batch.warnings), 1)
 
     def test_sensitive_explicit_inputs_rejected(self):
         auth = self.json_file([], "auth.json")

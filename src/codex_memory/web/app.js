@@ -26,7 +26,7 @@ function notice(message, error = false) {
 }
 function setConnection(connected) {
   $("connection-dot").classList.toggle("offline", !connected);
-  $("connection-text").textContent = connected ? "本机已连接 · 自动更新" : "连接中断 · 请启动本地服务";
+  $("connection-text").textContent = connected ? "本机服务已连接 · 请核对采集覆盖" : "连接中断 · 请启动本地服务";
 }
 async function api(path, options = {}) {
   const headers = {...options.headers};
@@ -46,6 +46,33 @@ function formValues(form) { return Object.fromEntries(new FormData(form).entries
 function result(value) {
   $("operation-result-card").hidden = false;
   $("operation-result").textContent = JSON.stringify(value, null, 2);
+}
+function importSummary(report) {
+  const coverage = report.coverage || {};
+  const warnings = Array.isArray(report.warnings) ? report.warnings : [];
+  const omitted = Number(report.warnings_omitted || 0);
+  const seenKnown = report.conversations_seen !== undefined && report.messages_seen !== undefined;
+  const noChats = coverage.status === "no_chat_history" || (seenKnown && !Number(report.conversations_seen) && !Number(report.messages_seen));
+  const partial = coverage.status === "partial" || warnings.length > 0 || omitted > 0;
+  const complete = coverage.status === "complete" && !partial;
+  return {level: noChats || partial ? "warning" : complete ? "complete" : "unknown",
+    title: noChats ? "未解析到聊天历史" : partial ? "导入已处理，但存在警告 / 覆盖缺口" : complete ? "所选导出已完整解析" : "导入已处理，覆盖情况待核对",
+    description: `${seenKnown ? `解析到 ${Number(report.conversations_seen)} 个会话 / ${Number(report.messages_seen)} 条消息；` : ""}本次新增或更新 ${Number(report.conversations || 0)} 个会话 / ${Number(report.messages || 0)} 条消息。重复导入可能没有新增，不代表没有聊天。完整性只针对所选导出，不保证全账户历史、记忆或附件均已取得。`,
+    warnings, omitted, coverage};
+}
+function showImportReport(report, kind) {
+  const panel = $("import-report");
+  panel.replaceChildren();
+  panel.hidden = kind !== "chatgpt";
+  if (kind !== "chatgpt") return;
+  const summary = importSummary(report);
+  panel.append(node("h3", "", summary.title), node("p", "muted", summary.description));
+  const coverage = summary.coverage;
+  if (coverage.chat_files_found !== undefined) panel.append(node("p", "muted", `聊天文件：发现 ${coverage.chat_files_found} / 已解析 ${coverage.chat_files_parsed || 0} / 不支持 ${coverage.chat_files_unsupported || 0}。附件：匹配 ${coverage.attachments_matched || 0} / 缺失 ${coverage.attachments_missing || 0} / 歧义 ${coverage.attachments_ambiguous || 0} / 仅外部引用 ${coverage.attachments_external || 0}。引用检查达到限额的消息：${coverage.references_truncated || 0}。`));
+  for (const warning of summary.warnings.slice(0, 8)) panel.append(node("p", "source-warning", String(warning).slice(0, 1600)));
+  if (summary.warnings.length > 8 || summary.omitted) panel.append(node("p", "source-warning", `另有 ${Math.max(0, summary.warnings.length - 8) + summary.omitted} 条警告未在此预览，请核对下方报告。`));
+  panel.append(node("p", "muted", "请搜索一段旧账户的关键原话并检查附件，再生成交接包；解析完成不是跨账户续接验收完成。"));
+  notice(summary.title + "；请核对数量和覆盖报告。", summary.level === "warning");
 }
 async function action(button, task) {
   const previous = button.textContent;
@@ -97,8 +124,12 @@ async function loadStats() {
   status.replaceChildren();
   const live = stats.live || {};
   const sync = stats.sync || {};
+  const chatgpt = stats.chatgpt_archive || {};
   for (const [label, value] of [["最近浏览器采集", date(live.at)], ["当前采集账户", live.account || "尚未配对 / 未采集"],
-    ["最近来源同步", sync.running ? "正在同步…" : date(sync.at)], ["同步状态", sync.error || "本地面板运行期间自动同步"]]) {
+    ["ChatGPT 已归档会话", String(chatgpt.conversations ?? stats.conversation_sources?.chatgpt ?? 0)],
+    ["ChatGPT 最近入库", date(chatgpt.last_ingest_at)],
+    ["最近导出导入", chatgpt.last_export_at ? date(chatgpt.last_export_at) : "暂无覆盖报告（未导入或旧格式）"],
+    ["最近来源同步", sync.running ? "正在同步…" : date(sync.at)], ["同步状态", sync.error || (sync.running ? "正在扫描配置来源" : "请核对来源与最后成功时间；网页采集还需启用扩展")]]) {
     const row = node("div", "status-row");
     row.append(node("span", "", label), node("span", "", value));
     status.append(row);
@@ -266,6 +297,7 @@ async function loadSources() {
     row.append(meta);
     const report = typeof source.last_report === "string" ? (() => {try {return JSON.parse(source.last_report);} catch {return {};}})() : source.last_report || {};
     if (report.error) row.append(node("div", "source-warning", report.error));
+    if (source.kind === "chatgpt" && report.coverage) row.append(node("p", "muted", importSummary(report).title + "（仅所选导出范围）"));
     if (report.warnings && report.warnings.length) row.append(node("div", "source-warning", report.warnings.slice(0, 3).join("\n")));
     container.append(row);
   }
@@ -274,6 +306,9 @@ async function openHandoff(values) {
   const data = await api("/api/handoff?" + query(values));
   state.handoffQuery = values;
   $("handoff-content").value = data.text;
+  $("handoff-share-confirm").checked = false;
+  $("handoff-copy").disabled = true;
+  $("handoff-download").setAttribute("aria-disabled", "true");
   $("handoff-download").href = "/api/handoff?" + query({...values, download: "1"});
   $("handoff-dialog").showModal();
 }
@@ -350,7 +385,12 @@ $("project-handoff").addEventListener("click", () => action($("project-handoff")
   await openHandoff({project: $("project-select").value, task: $("handoff-task").value.trim()});
 }));
 $("handoff-close").addEventListener("click", () => $("handoff-dialog").close());
-$("handoff-copy").addEventListener("click", () => action($("handoff-copy"), () => clipboard($("handoff-content").value)));
+$("handoff-share-confirm").addEventListener("change", (event) => {
+  $("handoff-copy").disabled = !event.target.checked;
+  $("handoff-download").setAttribute("aria-disabled", String(!event.target.checked));
+});
+$("handoff-download").addEventListener("click", (event) => {if (!$("handoff-share-confirm").checked) {event.preventDefault(); notice("请先审阅并确认要分享的交接内容。", true);}});
+$("handoff-copy").addEventListener("click", () => {if ($("handoff-share-confirm").checked) action($("handoff-copy"), () => clipboard($("handoff-content").value));});
 $("pairing-button").addEventListener("click", () => action($("pairing-button"), async () => {
   const pairing = await api("/api/pairing");
   $("pairing-token").value = pairing.collector_token;
@@ -365,8 +405,11 @@ $("source-form").addEventListener("submit", (event) => {
 $("import-form").addEventListener("submit", (event) => {
   event.preventDefault(); action(event.submitter, async () => {
     const values = formValues(event.target);
-    result(await api(values.kind === "project" ? "/api/project" : "/api/import", {body: values}));
-    await loadStats(); notice("导入完成，详细覆盖情况请查看操作结果。");
+    const report = await api(values.kind === "project" ? "/api/project" : "/api/import", {body: values});
+    result(report);
+    await loadStats();
+    if (values.kind === "chatgpt") showImportReport(report, values.kind);
+    else {$("import-report").hidden = true; notice("导入已处理，请查看操作结果及警告。");}
   });
 });
 $("checkpoint-form").addEventListener("submit", (event) => {

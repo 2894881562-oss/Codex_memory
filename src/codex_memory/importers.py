@@ -11,6 +11,7 @@ import json
 import math
 import mimetypes
 import os
+import re
 import stat
 import zipfile
 from datetime import UTC, datetime
@@ -18,6 +19,7 @@ from hashlib import sha256
 from io import BytesIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from .models import Conversation, ImportBatch, Message
 
@@ -26,7 +28,10 @@ MAX_TOTAL_BYTES = 1024 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 10000
 MAX_COMPRESSION_RATIO = 2000
 MAX_METADATA_BYTES = 16384
-MAX_WARNINGS = 250
+MAX_WARNINGS = 200
+MAX_WARNING_CHARS = 1000
+MAX_REFERENCES = 200
+MAX_REFERENCE_NODES = 20000
 MAX_JSONL_RECORD_BYTES = 8 * 1024 * 1024
 
 _SENSITIVE = frozenset(
@@ -133,14 +138,19 @@ _ANCILLARY_EXPORTS = frozenset(
         "group_chats.json",
     }
 )
+_CHAT_HISTORY_NAME = re.compile(r"conversations(?:[-_]([0-9]+))?\.json", re.IGNORECASE | re.ASCII)
 
 
 def _warn(batch: ImportBatch, message: str) -> None:
     # A corrupt million-line file must not produce a million-line report.
     if len(batch.warnings) < MAX_WARNINGS:
+        message = _clean_text(message)
+        if len(message) > MAX_WARNING_CHARS:
+            suffix = " [warning truncated]"
+            message = message[: max(0, MAX_WARNING_CHARS - len(suffix))] + suffix
         batch.warnings.append(message)
-    elif len(batch.warnings) == MAX_WARNINGS:
-        batch.warnings.append("Additional import warnings omitted; inspect archived raw inputs.")
+    else:
+        batch.warnings_omitted += 1
 
 
 def _sensitive(parts: tuple[str, ...] | list[str]) -> bool:
@@ -238,6 +248,24 @@ def _metadata(value: Any) -> dict[str, Any]:
                 bounded[key] = entry
         if isinstance(value.get("references"), list):
             bounded["references"] = [_clean_text(ref)[:256] for ref in value["references"][:10]]
+            while len(json.dumps(bounded["references"], ensure_ascii=True)) > MAX_METADATA_BYTES // 4:
+                bounded["references"].pop()
+            bounded["references_truncated"] = len(bounded["references"]) < len(value["references"])
+        if isinstance(value.get("attachment_links"), list):
+            links: list[dict[str, Any]] = []
+            for link in value["attachment_links"][:10]:
+                if not isinstance(link, dict):
+                    continue
+                entry = {
+                    key: _clean_text(link[key])[: (512 if key == "artifact" else 256)]
+                    for key in ("reference", "status", "artifact", "sha256", "match_type")
+                    if isinstance(link.get(key), str)
+                }
+                if len(json.dumps([*links, entry], ensure_ascii=True)) > MAX_METADATA_BYTES // 4:
+                    break
+                links.append(entry)
+            bounded["attachment_links"] = links
+            bounded["attachment_links_truncated"] = len(links) < len(value["attachment_links"])
     while (
         len(json.dumps(bounded, ensure_ascii=True).encode("utf-8")) > MAX_METADATA_BYTES
         and bounded["raw_preview"]
@@ -325,30 +353,68 @@ def _text(value: Any, depth: int = 0) -> str:
     return "\n".join(parts)
 
 
-def _references(value: Any) -> list[str]:
+def _references(value: Any, batch: ImportBatch | None = None) -> list[str]:
     found: list[str] = []
-    pending = [value]
+    seen: set[str] = set()
+    # Iterator frames do not enqueue a whole million-item list. Each inspected
+    # field/list item consumes the same bounded budget, including duplicates.
+    pending = [iter((("", value, False),))]
     visited = 0
-    while pending and visited < 20000:
-        item = pending.pop()
+    truncated = False
+
+    def list_rows(items: list[Any], attachments: bool):
+        return (("", item, attachments) for item in items)
+
+    def remember(ref: Any) -> None:
+        nonlocal truncated
+        if isinstance(ref, str) and ref not in seen:
+            if len(found) >= MAX_REFERENCES:
+                truncated = True
+                return
+            seen.add(ref)
+            found.append(ref)
+
+    while pending and not truncated:
+        try:
+            key, item, attachment_entry = next(pending[-1])
+        except StopIteration:
+            pending.pop()
+            continue
+        if visited >= MAX_REFERENCE_NODES:
+            truncated = True
+            break
         visited += 1
+        if key in {"asset_pointer", "file_id", "file_url", "image_url", "audio_url"}:
+            remember(item.get("url") if isinstance(item, dict) else item)
+        if attachment_entry and isinstance(item, dict):
+            remember(item.get("id") or item.get("name"))
         if isinstance(item, dict):
-            for key, val in item.items():
-                if key in {"asset_pointer", "file_id", "file_url", "image_url", "audio_url"}:
-                    ref = val.get("url") if isinstance(val, dict) else val
-                    if isinstance(ref, str) and ref not in found:
-                        found.append(ref)
-                elif key == "attachments" and isinstance(val, list):
-                    for attachment in val:
-                        if isinstance(attachment, dict):
-                            ref = attachment.get("id") or attachment.get("name")
-                            if isinstance(ref, str) and ref not in found:
-                                found.append(ref)
-                if isinstance(val, (dict, list)):
-                    pending.append(val)
+            pending.append(iter((name, child, False) for name, child in item.items()))
         elif isinstance(item, list):
-            pending.extend(val for val in item if isinstance(val, (dict, list)))
-    return found[:200]
+            pending.append(list_rows(item, key == "attachments"))
+    if truncated:
+        if batch is not None:
+            batch.coverage["references_truncated"] += 1
+            _warn(batch, "Attachment reference inspection reached a per-message limit; raw content retained.")
+    return found
+
+
+def _history_name(name: str) -> bool:
+    return _CHAT_HISTORY_NAME.fullmatch(PurePosixPath(name).name) is not None
+
+
+def _export_order(name: str) -> tuple[Any, ...]:
+    """Canonical history first, then natural numeric shards, without huge int conversion."""
+    match = _CHAT_HISTORY_NAME.fullmatch(PurePosixPath(name).name)
+    digits = ((match.group(1) or "").lstrip("0") or "0") if match else ""
+    return (
+        0 if match else 1,
+        0 if match and match.group(1) is None else 1,
+        len(digits),
+        digits,
+        name.casefold(),
+        name,
+    )
 
 
 def _export_member(name: str) -> bool:
@@ -360,7 +426,7 @@ def _export_member(name: str) -> bool:
         part.casefold() in {"attachments", "files", "assets"} for part in path.parts[:-1]
     )
     return (
-        base == "conversations.json"
+        _history_name(name)
         or base in _ANCILLARY_EXPORTS
         or path.suffix.casefold() in _DOCUMENT_SUFFIXES
         or attachment
@@ -393,11 +459,7 @@ def _chatgpt_inputs(path: Path, batch: ImportBatch) -> list[tuple[str, bytes]]:
             return
         total += len(blob)
         batch.artifacts.append((f"chatgpt/{name}", blob, _mime(name)))
-        if (
-            PurePosixPath(name).name.casefold() == "conversations.json"
-            or path.is_file()
-            and path.suffix.casefold() == ".json"
-        ):
+        if _history_name(name) or path.is_file() and path.suffix.casefold() == ".json":
             inputs.append((name, blob))
 
     if _has_symlink(path) or _sensitive(list(path.parts)):
@@ -406,14 +468,16 @@ def _chatgpt_inputs(path: Path, batch: ImportBatch) -> list[tuple[str, bytes]]:
         # Only user-selected exports; credentials and browser dirs are pruned.
         for folder, dirs, files in os.walk(path, followlinks=False):
             dirs[:] = sorted(d for d in dirs if not _sensitive([d]) and not _is_link(Path(folder) / d))
-            for name in sorted(files):
+            for name in sorted(files, key=_export_order):
                 candidate = Path(folder) / name
                 relative = candidate.relative_to(path).as_posix()
                 if not _export_member(relative):
                     continue
+                if _history_name(relative):
+                    batch.coverage["chat_files_found"] += 1
                 if len(batch.artifacts) >= MAX_ARCHIVE_ENTRIES:
                     _warn(batch, "Export entry limit reached; remaining files not imported.")
-                    return inputs
+                    return sorted(inputs, key=lambda entry: _export_order(entry[0]))
                 blob = _snapshot(candidate, batch)
                 if blob is not None:
                     accept(relative, blob)
@@ -430,7 +494,9 @@ def _chatgpt_inputs(path: Path, batch: ImportBatch) -> list[tuple[str, bytes]]:
                 if declared > MAX_TOTAL_BYTES:
                     raise ValueError("ZIP exceeds uncompressed total byte limit")
                 names: set[str] = set()
-                for info in entries:
+                # Preserve the first entry among exact duplicate names. Other
+                # member ordering no longer changes shard parsing order.
+                for info in sorted(entries, key=lambda entry: _export_order(entry.filename)[:-1]):
                     if info.is_dir():
                         continue
                     name = info.filename
@@ -454,6 +520,8 @@ def _chatgpt_inputs(path: Path, batch: ImportBatch) -> list[tuple[str, bytes]]:
                     if not _export_member(name):
                         batch.skipped += 1
                         continue
+                    if _history_name(name):
+                        batch.coverage["chat_files_found"] += 1
                     if (
                         info.file_size > MAX_FILE_BYTES
                         or info.flag_bits & 1
@@ -480,16 +548,160 @@ def _chatgpt_inputs(path: Path, batch: ImportBatch) -> list[tuple[str, bytes]]:
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
             raise ValueError(f"Invalid or unsafe export ZIP: {exc}") from exc
     elif path.is_file() and path.suffix.casefold() == ".json" and not _sensitive([path.name]):
+        batch.coverage["chat_files_found"] += 1
         blob = _snapshot(path, batch)
         if blob is not None:
             accept(path.name, blob)
     else:
         raise ValueError("Select an official ChatGPT ZIP, conversations JSON, or export directory.")
-    return inputs
+    return sorted(inputs, key=lambda entry: _export_order(entry[0]))
+
+
+class _AttachmentIndex:
+    """Associate pointers with archived bytes only; never open or download a pointer."""
+
+    def __init__(self, batch: ImportBatch, history_inputs: list[tuple[str, bytes]]) -> None:
+        self.batch = batch
+        histories = {f"chatgpt/{name}" for name, _ in history_inputs}
+        self.artifacts: dict[str, bytes] = {}
+        self.paths: dict[str, set[str]] = {}
+        self.names: dict[str, set[str]] = {}
+        self.file_ids: dict[str, set[str]] = {}
+        self.results: dict[tuple[str, str, tuple[str, ...]], dict[str, Any]] = {}
+        self.digests: dict[str, str] = {}
+        for name, blob, _ in batch.artifacts:
+            path = PurePosixPath(name)
+            if name in histories or path.name.casefold() in _ANCILLARY_EXPORTS:
+                continue
+            self.artifacts[name] = blob
+            relative = name.removeprefix("chatgpt/")
+            for alias in (name, relative):
+                self.paths.setdefault(alias.casefold(), set()).add(name)
+            self.names.setdefault(path.name.casefold(), set()).add(name)
+            stem = path.stem.casefold()
+            if stem.startswith("file-"):
+                self.file_ids.setdefault(stem, set()).add(name)
+                # Explicit export convention: file-<alphanumeric id>-<filename>.
+                # A unique alias is required, and prefix collisions are never chosen.
+                match = re.match(r"(file-[a-z0-9]+)-", stem)
+                if match:
+                    self.file_ids.setdefault(match.group(1), set()).add(name)
+        batch.coverage["attachments_available"] = len(self.artifacts)
+
+    @staticmethod
+    def _local_key(reference: str) -> tuple[str, bool]:
+        try:
+            parsed = urlsplit(reference)
+        except ValueError:
+            return "", False
+        if parsed.scheme:
+            if parsed.scheme.casefold() != "file-service":
+                return "", True
+            key = unquote(parsed.netloc + parsed.path).lstrip("/")
+        else:
+            key = unquote(reference)
+        return (key, False) if _safe_zip_name(key) else ("", False)
+
+    def _lookup(self, key: str, origin: str, *, file_id: bool = True) -> tuple[set[str], str]:
+        if not key:
+            return set(), ""
+        if "/" in key:
+            # Qualified paths can disambiguate repeated basenames; an incorrect
+            # qualified path must not fall back to a guessed basename.
+            direct = self.paths.get(key.casefold(), set())
+            joined = str(PurePosixPath(origin) / key)
+            relative = self.paths.get(joined.casefold(), set())
+            # If archive-root and export-relative interpretations disagree,
+            # preserve the ambiguity instead of selecting by lookup priority.
+            return set(direct) | set(relative), "path" if direct else "relative_path"
+        candidates = self.names.get(key.casefold(), set())
+        if candidates:
+            return set(candidates), "filename"
+        return (
+            set(self.file_ids.get(key.casefold(), set())) if file_id else set(),
+            "file_id_filename" if file_id else "attachment_name",
+        )
+
+    def resolve(self, reference: str, artifact: str, hints: tuple[str, ...] = ()) -> dict[str, Any]:
+        origin = str(PurePosixPath(artifact.removeprefix("chatgpt/")).parent)
+        cache_key = (reference, origin, hints)
+        if cache_key in self.results:
+            return self.results[cache_key]
+        key, external = self._local_key(reference)
+        result: dict[str, Any] = {"reference": reference}
+        if external:
+            status = "external"
+        else:
+            candidates, match_type = self._lookup(key, origin)
+            had_primary = bool(candidates)
+            for hint in hints:
+                hint_key, hint_external = self._local_key(hint)
+                if hint_external:
+                    continue
+                hinted, _ = self._lookup(hint_key, origin, file_id=False)
+                if hinted:
+                    candidates.update(hinted)
+                    if not had_primary:
+                        match_type = "attachment_name"
+            if len(candidates) == 1:
+                status = "matched"
+                name = next(iter(candidates))
+                if name not in self.digests:
+                    self.digests[name] = sha256(self.artifacts[name]).hexdigest()
+                result.update(artifact=name, sha256=self.digests[name], match_type=match_type)
+            elif candidates:
+                status = "ambiguous"
+                result["candidate_count"] = len(candidates)
+            else:
+                status = "missing"
+        result["status"] = status
+        self.results[cache_key] = result
+        self.batch.coverage[f"attachments_{status}"] += 1
+        return result
+
+
+def _attachment_hints(message: dict[str, Any]) -> tuple[dict[str, tuple[str, ...]], bool]:
+    """Build ID/name evidence once, with entry, ID and per-ID name budgets."""
+    containers = [message]
+    if isinstance(message.get("metadata"), dict):
+        containers.append(message["metadata"])
+    hints: dict[str, set[str]] = {}
+    scanned = 0
+    truncated = False
+    for container in containers:
+        attachments = container.get("attachments")
+        for attachment in attachments if isinstance(attachments, list) else []:
+            if scanned >= MAX_REFERENCE_NODES:
+                truncated = True
+                break
+            scanned += 1
+            if not isinstance(attachment, dict):
+                continue
+            attachment_id = attachment.get("id")
+            name = attachment.get("name")
+            if not isinstance(attachment_id, str) or not isinstance(name, str):
+                continue
+            if attachment_id not in hints and len(hints) >= MAX_REFERENCES:
+                truncated = True
+                break
+            names = hints.setdefault(attachment_id, set())
+            if name not in names and len(names) >= MAX_REFERENCES:
+                truncated = True
+                break
+            names.add(name)
+        if truncated:
+            break
+    return {key: tuple(sorted(names)) for key, names in hints.items()}, truncated
 
 
 def _chatgpt_conversation(
-    raw: dict[str, Any], index: int, artifact: str, account: str, project: str, batch: ImportBatch
+    raw: dict[str, Any],
+    index: int,
+    artifact: str,
+    account: str,
+    project: str,
+    batch: ImportBatch,
+    attachments_index: _AttachmentIndex,
 ) -> Conversation:
     conv_id = _identifier(
         raw.get("id") or raw.get("conversation_id"),
@@ -556,7 +768,20 @@ def _chatgpt_conversation(
         for attachment in attachments if isinstance(attachments, list) else []:
             if isinstance(attachment, dict):
                 extracted += f"\n[Attachment: {attachment.get('name') or attachment.get('id') or 'unnamed'}; bytes only if included in export]"
-        msg_refs = _references(msg)
+        previously_truncated = batch.coverage["references_truncated"]
+        msg_refs = _references(msg, batch)
+        hints, hints_truncated = _attachment_hints(msg)
+        if hints_truncated and batch.coverage["references_truncated"] == previously_truncated:
+            batch.coverage["references_truncated"] += 1
+            _warn(
+                batch,
+                "Attachment name evidence inspection reached a per-message limit; raw content retained.",
+            )
+        attachment_links = []
+        for ref in msg_refs:
+            key, _ = _AttachmentIndex._local_key(ref)
+            explicit_names = tuple(sorted(set(hints.get(ref, ())) | set(hints.get(key, ()))))
+            attachment_links.append(attachments_index.resolve(ref, artifact, explicit_names))
         refs.extend(ref for ref in msg_refs if ref not in refs)
         content_type = content.get("content_type", "message") if isinstance(content, dict) else "message"
         kind = "tool" if role == "tool" else str(content_type or "message")
@@ -567,6 +792,7 @@ def _chatgpt_conversation(
                 "children": node.get("children", []),
                 "artifact": artifact,
                 "references": msg_refs,
+                "attachment_links": attachment_links,
                 "current_node": node_id == str(raw.get("current_node", "")),
                 "untrusted": True,
             }
@@ -607,50 +833,100 @@ def parse_chatgpt(path: Path, account: str, project: str = "") -> ImportBatch:
     """Import an official export without extracting files or calling cloud services."""
     path = Path(path).absolute()
     batch = ImportBatch()
+    batch.coverage = {
+        "scope": "provided_export_only",
+        "status": "no_chat_history",
+        "chat_files_found": 0,
+        "chat_files_parsed": 0,
+        "chat_files_unsupported": 0,
+        "attachments_available": 0,
+        "attachments_matched": 0,
+        "attachments_missing": 0,
+        "attachments_ambiguous": 0,
+        "attachments_external": 0,
+        # Number of message records whose reference inspection hit a limit;
+        # the unknown number of uninspected references is never invented.
+        "references_truncated": 0,
+    }
     inputs = _chatgpt_inputs(path, batch)
-    if not inputs:
-        _warn(batch, "No conversations.json found; ChatGPT message history was not imported.")
+    attachments_index = _AttachmentIndex(batch, inputs)
+    incomplete = bool(batch.warnings or batch.warnings_omitted)
     for name, blob in inputs:
         raw = _json(blob, name, batch)
         if raw is None:
+            batch.coverage["chat_files_unsupported"] += 1
             continue
         if isinstance(raw, list):
             records = raw
         elif isinstance(raw, dict) and isinstance(raw.get("conversations"), list):
             records = raw["conversations"]
-        elif isinstance(raw, dict) and ("mapping" in raw or "messages" in raw):
+        elif isinstance(raw, dict) and (
+            isinstance(raw.get("mapping"), dict) or isinstance(raw.get("messages"), list)
+        ):
             records = [raw]
         else:
+            batch.coverage["chat_files_unsupported"] += 1
             _warn(batch, f"{name}: unsupported export schema; raw JSON retained.")
             continue
+        recognized = 0
         for index, record in enumerate(records):
-            if not isinstance(record, dict):
+            if not isinstance(record, dict) or not (
+                isinstance(record.get("mapping"), dict) or isinstance(record.get("messages"), list)
+            ):
                 batch.skipped += 1
-                _warn(batch, f"{name}: conversation {index} is not an object.")
+                incomplete = True
+                _warn(
+                    batch,
+                    f"{name}: conversation {index} has no supported message mapping; raw JSON retained.",
+                )
                 continue
+            recognized += 1
+            before = len(batch.warnings) + batch.warnings_omitted
             batch.conversations.append(
-                _chatgpt_conversation(record, index, f"chatgpt/{name}", account, project, batch)
+                _chatgpt_conversation(
+                    record, index, f"chatgpt/{name}", account, project, batch, attachments_index
+                )
             )
-    available = [PurePosixPath(name).name.casefold() for name, _, _ in batch.artifacts]
-    missing_refs: list[str] = []
-    for conv in batch.conversations:
-        for message in conv.messages:
-            for reference in message.metadata.get("references", []):
-                # Remote URLs remain pointers; never silently fetch external media.
-                ref = reference.rsplit("/", 1)[-1].casefold()
-                if not any(ref == filename or filename.startswith(ref + "-") for filename in available):
-                    if reference not in missing_refs:
-                        missing_refs.append(reference)
-    if missing_refs:
+            if len(batch.warnings) + batch.warnings_omitted > before:
+                incomplete = True
+        if recognized or not records:
+            batch.coverage["chat_files_parsed"] += 1
+        else:
+            batch.coverage["chat_files_unsupported"] += 1
+            _warn(batch, f"{name}: unsupported export schema; no recognizable conversations in JSON.")
+    missing = batch.coverage["attachments_missing"]
+    ambiguous = batch.coverage["attachments_ambiguous"]
+    external = batch.coverage["attachments_external"]
+    if missing:
         _warn(
             batch,
-            f"{len(missing_refs)} attachment/media references have no matching local bytes; text references preserved. Examples: "
-            + ", ".join(missing_refs[:5]),
+            f"{missing} attachment/media references have no matching local bytes; text references preserved.",
         )
-    _warn(
-        batch,
-        "Coverage is limited to this export: deleted/temporary chats, remote media, account memories and closed/live chats may be absent.",
-    )
+    if ambiguous:
+        _warn(
+            batch,
+            f"{ambiguous} attachment references match multiple local artifacts; no ambiguous link was selected.",
+        )
+    if external:
+        _warn(
+            batch, f"{external} external media references retained as pointers; no remote bytes downloaded."
+        )
+    if any(conv.messages for conv in batch.conversations):
+        batch.coverage["status"] = (
+            "partial"
+            if incomplete
+            or batch.coverage["chat_files_parsed"] != batch.coverage["chat_files_found"]
+            or missing
+            or ambiguous
+            or external
+            or batch.coverage["references_truncated"]
+            else "complete"
+        )
+    else:
+        _warn(
+            batch,
+            "No recognizable ChatGPT message history was imported; select conversations.json or numeric conversations-1.json / conversations_1.json shards with supported content.",
+        )
     return batch
 
 

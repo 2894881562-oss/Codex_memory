@@ -6,7 +6,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from codex_memory.continuation import TextBudget, anchors, context_neighbors, keywords, select_evidence
+from codex_memory.continuation import (
+    TextBudget,
+    anchors,
+    context_neighbors,
+    keywords,
+    memory_context,
+    rank_memories,
+    select_evidence,
+)
 from codex_memory.models import Conversation, ImportBatch, Message
 from codex_memory.service import MemoryService
 
@@ -307,6 +315,103 @@ class ContinuationTests(unittest.TestCase):
         output.add("x" * 100000)
         self.assertLessEqual(len(output.finish()), 1000)
         self.assertTrue(output.finish().endswith("FOOTER"))
+
+    def memory_record(self, key, value, status="confirmed", project="memory"):
+        return {
+            "id": key.encode().hex().ljust(32, "0")[:32],
+            "key": key,
+            "value": value,
+            "status": status,
+            "project": project,
+            "evidence": ["a" * 32],
+        }
+
+    def test_memory_ranking_uses_short_chinese_task_not_alphabet(self):
+        unrelated = self.memory_record("aaa_weather", "今天喜欢晴天")
+        related = self.memory_record("zzz_restore", "备份必须先核对来源")
+        for task in ("备份", "账户", "续接"):
+            related["value"] = f"{task}必须先核对来源"
+            with self.subTest(task=task):
+                ranked = rank_memories([unrelated, related], anchors(task, None))
+                self.assertEqual(ranked[0]["id"], related["id"])
+        self.assertEqual(unrelated["value"], "今天喜欢晴天")
+
+    def test_memory_explicit_task_outranks_checkpoint_and_empty_ties_are_stable(self):
+        weather = self.memory_record("aaa_weather", "天气预报采用晴天主题")
+        backup = self.memory_record("zzz_restore", "备份校验 SHA256")
+        checkpoint = {"goal": "天气预报", "decisions": "晴天主题", "next_steps": "天气"}
+        ranked = rank_memories([weather, backup], anchors("备份", checkpoint))
+        self.assertEqual(ranked[0]["key"], "zzz_restore")
+        self.assertEqual(rank_memories([backup, weather], {}), [weather, backup])
+        self.assertEqual(rank_memories([weather, backup], anchors("", checkpoint))[0], weather)
+
+    def test_memory_selector_never_promotes_proposed_or_withdrawn(self):
+        records = [
+            self.memory_record("confirmed", "备份只读"),
+            self.memory_record("pending", "备份 PENDING_VALUE", status="proposed"),
+            self.memory_record("withdrawn", "备份 WITHDRAWN_VALUE", status="withdrawn"),
+        ]
+        text = memory_context(records, anchors("备份", None), 800)
+        self.assertIn("备份只读", text)
+        self.assertNotIn("PENDING_VALUE", text)
+        self.assertNotIn("WITHDRAWN_VALUE", text)
+        self.assertIn("1/1 条确认记忆", text)
+
+    def test_long_memory_keeps_matching_window_source_and_visible_omissions(self):
+        unrelated = self.memory_record("aaa_unrelated", "无关内容" * 100)
+        related = self.memory_record("zzz_restore", "无关前缀" * 1000 + "备份先核对 SHA256")
+        text = memory_context([unrelated, related], anchors("备份", None), 350)
+        self.assertIn("备份先核对 SHA256", text)
+        self.assertIn(related["id"], text)
+        self.assertIn("a" * 32, text)
+        self.assertIn("[记忆摘要截断]", text)
+        self.assertIn("预算省略键", text)
+        self.assertIn("aaa_unrelated", text)
+        self.assertLessEqual(len(text), 350)
+        self.assertEqual(text, memory_context([unrelated, related], anchors("备份", None), 350))
+
+    def test_memory_section_budget_includes_long_key_report_and_sources(self):
+        records = [self.memory_record(f"key{i}" + "x" * 100, "备份" * 1000) for i in range(30)]
+        for budget in (260, 350, 600, 2500):
+            text = memory_context(records, anchors("备份", None), budget)
+            self.assertLessEqual(len(text), budget)
+            self.assertIn("list_user_memory", text)
+            self.assertIn("预算省略键", text)
+            self.assertIn("[键清单截断]", text)
+
+    def test_short_package_keeps_relevant_memory_checkpoint_and_historical_evidence(self):
+        cid = self.thread("source", [Message("fact", "user", "备份原始决定 HISTORIC_EVIDENCE")])
+        source = self.service.fetch_conversation(cid)["messages"][0]["id"]
+        for index in range(5):
+            self.service.save_user_memory(
+                f"aaa_weather{index}",
+                "无关天气" * 100,
+                project="memory",
+                status="confirmed",
+                evidence=[source],
+            )
+        record = self.service.save_user_memory(
+            "zzz_backup", "备份先核对 SHA256", project="memory", status="confirmed", evidence=[source]
+        )
+        old = self.service.create_checkpoint("memory", "备份恢复", decisions="旧决定：人工核对")
+        latest = self.service.create_checkpoint(
+            "memory",
+            "备份恢复",
+            completed="已完成索引",
+            decisions="最新决定：不覆盖",
+            next_steps="检查来源",
+            blockers="等待真实导出",
+        )
+        text = self.service.handoff(project="memory", task="备份", max_chars=1000)
+        for marker in (record["id"], "备份先核对 SHA256", latest["id"], "不覆盖", "等待真实导出"):
+            self.assertIn(marker, text)
+        self.assertIn("与任务相关的历史证据", text)
+        self.assertIn("HISTORIC_EVIDENCE", text)
+        self.assertLessEqual(len(text), 1000)
+        larger = self.service.handoff(project="memory", task="备份", max_chars=3500)
+        self.assertIn(old["id"], larger)
+        self.assertIn("不覆盖最新检查点", larger)
+        self.assertIn("旧决定：人工核对", larger)
 
 
 if __name__ == "__main__":

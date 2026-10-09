@@ -8,7 +8,9 @@
 <label>当前账户标签<input name="account" required maxlength="128" placeholder="例如 plus-a（不必填写邮箱）"></label>
 <label>项目 / 主题名称（普通聊天建议 personal）<input name="project" maxlength="128" value="personal" placeholder="例如 Tao 或 personal"></label>
 <label class="checkbox"><input name="enabled" type="checkbox">启用实时归档</label>
-<p>切换 ChatGPT 登录账户前，请暂停归档并更换账户标签，然后打开目标聊天。标签由你指定，不会自动读取登录身份。</p>
+<label class="checkbox"><input name="confirm_account" type="checkbox">我已确认当前网页账户与标签一致，并关闭其他账户旧页面</label>
+<p>换号顺序：先暂停 → 检查旧队列（可手动重试）→ 保存新标签（仍暂停）→ 切换网页账户并关闭旧页 → 确认、启用 → 刷新目标聊天。标签由你指定，不会自动读取登录身份；旧队列始终保留旧标签。</p>
+<button id="pause" type="button">先暂停采集</button>
 <button type="submit">保存设置</button> <span id="notice" role="status"></span>
 </form>
 <p>令牌仅用于这份本地记忆库；不是 OpenAI API Key。扩展离线队列最多 100 批 / 6 MB，断开时保留并重试。离线流式回复会合并为最新可见版本。</p>

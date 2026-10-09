@@ -17,9 +17,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from . import __version__
+
 MAX_BODY = 5 * 1024 * 1024
 ASSETS = {"/": "index.html", "/app.js": "app.js", "/styles.css": "styles.css"}
 EXTENSION_ORIGIN = re.compile(r"chrome-extension://[a-p]{32}\Z")
+COLLECTOR_ROUTES = {"/api/live", "/api/resume", "/api/collector/status"}
 
 
 class RequestError(Exception):
@@ -45,6 +48,7 @@ class MemoryHTTPServer(ThreadingHTTPServer):
         self.operation_lock = threading.Lock()
         self.status_lock = threading.Lock()
         self.stop_event = threading.Event()
+        self.started_at = time.time()
         self.last_sync: dict[str, Any] = {"running": False, "at": None, "reports": []}
         self.last_live: dict[str, Any] = {"at": None, "account": "", "conversation_id": ""}
         super().__init__(("127.0.0.1", port), Handler)
@@ -100,7 +104,7 @@ class MemoryHTTPServer(ThreadingHTTPServer):
 
 class Handler(BaseHTTPRequestHandler):
     server: MemoryHTTPServer
-    server_version = "LocalMemory/0.1"
+    server_version = f"LocalMemory/{__version__}"
     sys_version = ""
 
     def setup(self) -> None:
@@ -229,7 +233,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         try:
             self._validate_host()
-            if urlsplit(self.path).path not in {"/api/live", "/api/resume"} or not self._extension_origin():
+            if urlsplit(self.path).path not in COLLECTOR_ROUTES or not self._extension_origin():
                 raise RequestError(403, "不接受该跨来源请求")
             self._headers(204, "application/json", cors=True)
         except Exception as exc:
@@ -258,7 +262,7 @@ class Handler(BaseHTTPRequestHandler):
                     "csrf_token": self.server.csrf_token,
                     "data_dir": str(service.data_dir),
                     "local_only": True,
-                    "version": "0.1.0",
+                    "version": __version__,
                 }
             elif path == "/api/stats":
                 result = service.stats()
@@ -267,6 +271,12 @@ class Handler(BaseHTTPRequestHandler):
                         **result,
                         "sync": dict(self.server.last_sync),
                         "live": dict(self.server.last_live),
+                        "runtime": {
+                            "online": True,
+                            "server_started_at": self.server.started_at,
+                            "checked_at": time.time(),
+                            "version": __version__,
+                        },
                     }
             elif path == "/api/conversations":
                 result = service.list_conversations(
@@ -347,12 +357,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
-        cors = path in {"/api/live", "/api/resume"}
+        cors = path in COLLECTOR_ROUTES
         try:
             self._validate_host()
-            if path in {"/api/live", "/api/resume"}:
+            if path in COLLECTOR_ROUTES:
                 self._collector()
                 body = self._body()
+                if path == "/api/collector/status":
+                    # A reachability check must not sync sources or expose the vault/token.
+                    with self.server.status_lock:
+                        last_live = dict(self.server.last_live)
+                    self._json(
+                        {
+                            "online": True,
+                            "version": __version__,
+                            "server_started_at": self.server.started_at,
+                            "checked_at": time.time(),
+                            "last_live": last_live,
+                            "coverage": "opened_rendered_chat_only",
+                        },
+                        cors=True,
+                    )
+                    return
                 if path == "/api/resume":
                     result = {
                         "handoff": self.server.service.handoff(

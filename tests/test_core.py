@@ -10,7 +10,7 @@ from pathlib import Path
 
 from codex_memory.models import Conversation, ImportBatch, Message
 from codex_memory.security import ensure_collector_token, redact, safe_relative
-from codex_memory.service import MemoryService
+from codex_memory.service import MemoryService, import_report_metadata
 
 
 class CoreTests(unittest.TestCase):
@@ -43,8 +43,129 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(a["conversations"], 1)
         self.assertEqual(b["messages"], 0)
         self.assertEqual(b["unchanged"], 1)
+        self.assertEqual(b["conversations_seen"], 1)
+        self.assertEqual(b["messages_seen"], 1)
         self.assertEqual(self.service.stats()["messages"], 1)
         self.assertTrue(self.service.audit()["ok"])
+
+    def test_import_diagnostics_are_bounded_redacted_and_count_omissions(self):
+        secret = "sk-proj-" + "A" * 40
+        batch = ImportBatch(
+            warnings=[f"problem {i} {secret}" for i in range(500)],
+            warnings_omitted=7,
+            coverage={"status": "complete", "chat_files_found": 1, "chat_files_parsed": 1},
+        )
+        result = import_report_metadata(batch)
+        self.assertEqual(len(result["warnings"]), 200)
+        self.assertEqual(result["warnings_omitted"], 308)
+        self.assertEqual(sum("Additional warnings omitted" in item for item in result["warnings"]), 1)
+        self.assertNotIn(secret, json.dumps(result))
+        self.assertEqual(result["coverage"]["status"], "partial")
+        self.assertEqual(result["coverage"]["scope"], "provided_export_only")
+        self.assertLessEqual(
+            len(import_report_metadata(ImportBatch(warnings=["a" * 5000]))["warnings"][0]), 1024
+        )
+
+    def test_invalid_diagnostics_fail_before_ingestion(self):
+        for coverage in (
+            {"status": "cloud_account_complete"},
+            {"status": ["complete"]},
+            {"status": "complete", "attachments_missing": True},
+            {"status": "complete", "references_truncated": -1},
+        ):
+            with self.subTest(coverage=coverage), self.assertRaises(ValueError):
+                self.service._ingest(ImportBatch(coverage=coverage), "chatgpt", "test")
+        self.assertFalse(self.service.data_dir.exists())
+        for omitted in (True, -1, "1"):
+            with self.subTest(omitted=omitted), self.assertRaises(ValueError):
+                import_report_metadata(ImportBatch(warnings_omitted=omitted))
+
+    def test_coverage_cannot_claim_complete_with_known_gaps(self):
+        for gap in (
+            {"chat_files_found": 2, "chat_files_parsed": 1},
+            {"attachments_external": 1},
+            {"attachments_missing": 1},
+            {"references_truncated": 1},
+        ):
+            with self.subTest(gap=gap):
+                report = import_report_metadata(ImportBatch(coverage={"status": "complete", **gap}))
+                self.assertEqual(report["coverage"]["status"], "partial")
+
+    def test_stats_distinguish_latest_export_from_live_ingestion(self):
+        empty = self.service.stats()["chatgpt_archive"]
+        self.assertEqual(empty["conversations"], 0)
+        self.assertIsNone(empty["last_export_at"])
+        self.assertEqual(empty["coverage"], {})
+        self.service._ingest(
+            ImportBatch(coverage={"status": "partial", "chat_files_found": 2, "chat_files_parsed": 1}),
+            "chatgpt",
+            "plus-a",
+        )
+        first = self.service.stats()["chatgpt_archive"]
+        self.service.ingest_live(
+            {
+                "account": "plus-a",
+                "conversation_id": "live-stats",
+                "messages": [{"id": "u1", "role": "user", "text": "续接"}],
+            }
+        )
+        second = self.service.stats()["chatgpt_archive"]
+        self.assertEqual(second["conversations"], 1)
+        self.assertEqual(second["last_export_at"], first["last_export_at"])
+        self.assertGreaterEqual(second["last_ingest_at"], second["last_export_at"])
+        self.assertEqual(second["coverage"]["status"], "partial")
+        self.assertEqual(second["coverage"]["chat_files_parsed"], 1)
+
+    def test_ignored_zip_members_are_not_chat_history_gaps(self):
+        source = self.root / "selected-export.zip"
+        history = [
+            {
+                "id": "complete-chat",
+                "mapping": {
+                    "u1": {
+                        "id": "u1",
+                        "message": {
+                            "id": "u1",
+                            "author": {"role": "user"},
+                            "content": {"content_type": "text", "parts": ["确认续接目标"]},
+                        },
+                    }
+                },
+            }
+        ]
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("conversations.json", json.dumps(history))
+            archive.writestr(".DS_Store", "ignored unrelated metadata")
+        report = self.service.import_chatgpt(source, "plus-a")
+        self.assertEqual(report["conversations_seen"], 1)
+        self.assertEqual(report["messages_seen"], 1)
+        self.assertGreater(report["skipped"], 0)
+        self.assertEqual(report["warnings"], [])
+        self.assertEqual(report["coverage"]["status"], "complete")
+
+    def test_restored_import_diagnostics_do_not_expose_arbitrary_metadata(self):
+        self.service.initialize()
+        with self.service.store.connect() as con:
+            for report in (
+                "invalid JSON",
+                json.dumps({"coverage": {"status": "SECRET_STATUS", "scope": "provided_export_only"}}),
+                json.dumps(
+                    {
+                        "coverage": {
+                            "status": "complete",
+                            "scope": "provided_export_only",
+                            "chat_files_found": "SECRET_COUNT",
+                        }
+                    }
+                ),
+            ):
+                con.execute(
+                    "INSERT INTO import_runs(source,account,created_at,report) VALUES(?,?,?,?)",
+                    ("chatgpt", "test", "2026-10-09", report),
+                )
+        stats = self.service.stats()
+        self.assertEqual(stats["chatgpt_archive"]["coverage"], {"status": "unknown"})
+        self.assertNotIn("SECRET", json.dumps(stats))
 
     def test_cross_account_archive_and_project_continuity(self):
         self.seed("plus-a", "账户 A 决定继续设计")

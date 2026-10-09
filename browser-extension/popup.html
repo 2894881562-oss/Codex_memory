@@ -1,12 +1,14 @@
 <!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>归档状态</title><link rel="stylesheet" href="style.css"></head><body class="popup"><main>
 <h1>本地记忆</h1><p id="connection">正在读取状态…</p>
-<dl><dt>账户标签</dt><dd id="account">—</dd><dt>待发送批次</dt><dd id="queue">—</dd><dt>已确认提交消息次数</dt><dd id="captured">—</dd><dt>最近页面观察</dt><dd id="capture">—</dd><dt>最近成功写入</dt><dd id="success">—</dd></dl>
+<dl><dt>账户标签</dt><dd id="account">—</dd><dt>待发送批次</dt><dd id="queue">—</dd><dt>积压原账户标签</dt><dd id="queue-accounts">—</dd><dt>已确认提交消息次数</dt><dd id="captured">—</dd><dt>最近页面观察</dt><dd id="capture">—</dd><dt>最近成功写入</dt><dd id="success">—</dd><dt>当前连接探测时间</dt><dd id="health">—</dd><dt>共享库最近网页写入</dt><dd id="server-success">—</dd></dl>
+<p id="coverage" class="small"></p>
 <p id="error" role="status"></p><button id="retry">立即重试</button> <button id="options">设置 / 配对</button>
 <hr><h2>从另一账户继续</h2>
 <label>项目 / 主题名称<input id="resume-project" maxlength="128" placeholder="Tao / personal"></label>
 <label>这次要继续的任务（可选）<textarea id="resume-task" maxlength="512" rows="2" placeholder="例如：继续离线队列重试；留空参考检查点目标与待办"></textarea></label>
 <button id="resume">读取本地记忆</button> <button id="copy" disabled>复制交接内容</button>
 <textarea id="handoff" rows="7" readonly placeholder="读取后可复制并粘贴到任意账户的聊天中；不会自动发送。"></textarea>
+<label class="checkbox small"><input id="share-confirm" type="checkbox">我已审阅，只分享本次愿意交给目标 GPT 账户的内容</label>
 <p id="resume-notice" class="small" role="status"></p>
 <p class="small">覆盖已打开并渲染的聊天；数字含消息修订和重试确认，不等于独立消息数。完整历史需要官方导出。</p>
 </main><script src="popup.js"></script></body></html>

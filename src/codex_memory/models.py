@@ -37,6 +37,8 @@ class ImportBatch:
     artifacts: list[tuple[str, bytes, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     skipped: int = 0
+    warnings_omitted: int = 0
+    coverage: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -48,6 +50,10 @@ class ImportReport:
     skipped: int = 0
     warnings: list[str] = field(default_factory=list)
     source: str = ""
+    warnings_omitted: int = 0
+    coverage: dict[str, Any] = field(default_factory=dict)
+    conversations_seen: int = 0
+    messages_seen: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         from dataclasses import asdict

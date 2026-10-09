@@ -88,6 +88,57 @@ class HTTPInterfaceTests(unittest.TestCase):
         status, stats, _ = self.request("GET", "/api/stats", headers={"Cookie": self.cookie})
         self.assertEqual(status, 200)
         self.assertIn("conversations", stats)
+        self.assertTrue(stats["runtime"]["online"])
+        self.assertEqual(stats["runtime"]["version"], __version__)
+        self.assertGreaterEqual(stats["runtime"]["checked_at"], stats["runtime"]["server_started_at"])
+
+    def test_collector_status_is_current_authenticated_read_only_and_minimal(self):
+        with (
+            patch.object(self.service, "sync_sources", side_effect=AssertionError("must not sync")),
+            patch.object(self.service, "ingest_live", side_effect=AssertionError("must not ingest")),
+            patch.object(self.service, "handoff", side_effect=AssertionError("must not build a handoff")),
+        ):
+            status, body, headers = self.request(
+                "POST", "/api/collector/status", {}, headers=self.collector_headers(extension=True)
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["online"])
+        self.assertEqual(body["version"], __version__)
+        self.assertGreaterEqual(body["checked_at"], self.server.started_at)
+        self.assertEqual(body["server_started_at"], self.server.started_at)
+        self.assertEqual(body["coverage"], "opened_rendered_chat_only")
+        self.assertEqual(
+            set(body), {"online", "version", "checked_at", "server_started_at", "last_live", "coverage"}
+        )
+        self.assertEqual(set(body["last_live"]), {"at", "account", "conversation_id"})
+        self.assertNotIn(self.server.collector_token, json.dumps(body))
+        self.assertNotIn(str(self.service.data_dir), json.dumps(body))
+        self.assertEqual(headers["Access-Control-Allow-Origin"], "chrome-extension://" + "a" * 32)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+
+    def test_collector_status_security_and_preflight(self):
+        for supplied, expected in (
+            ({}, 401),
+            ({"Authorization": "Bearer wrong"}, 401),
+            ({"Cookie": self.cookie}, 401),
+            ({**self.collector_headers(), "Origin": "https://chatgpt.com"}, 403),
+            ({**self.collector_headers(), "Host": "attacker.example"}, 403),
+        ):
+            with self.subTest(supplied={key: key for key in supplied}):
+                status, _, _ = self.request("POST", "/api/collector/status", {}, headers=supplied)
+                self.assertEqual(status, expected)
+        status, _, headers = self.request(
+            "OPTIONS", "/api/collector/status", headers={"Origin": "chrome-extension://" + "a" * 32}
+        )
+        self.assertEqual(status, 204)
+        self.assertEqual(headers["Access-Control-Allow-Methods"], "POST, OPTIONS")
+        self.assertEqual(headers["Access-Control-Allow-Private-Network"], "true")
+        status, _, _ = self.request(
+            "OPTIONS", "/api/collector/status", headers={"Origin": "https://attacker.example"}
+        )
+        self.assertEqual(status, 403)
+        status, _, _ = self.request("POST", "/api/collector/status", [], headers=self.collector_headers())
+        self.assertEqual(status, 400)
 
     def test_host_rebinding_rejected(self):
         status, _, _ = self.request("GET", "/", headers={"Host": "attacker.example"})

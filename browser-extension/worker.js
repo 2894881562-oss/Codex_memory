@@ -24,10 +24,55 @@ async function writeStatus(values) {
   await chrome.storage.local.set({status: {...status, ...values}});
 }
 
+async function probeConnection() {
+  const {settings = {}} = await chrome.storage.local.get("settings");
+  if (!settings.token) {
+    await writeStatus({online: false, health_error: "尚未配对", last_health_check: new Date().toISOString()});
+    return;
+  }
+  try {
+    const response = await fetch(endpoint(settings, "collector/status"), {
+      method: "POST", headers: {"Content-Type": "application/json", "Authorization": `Bearer ${settings.token}`},
+      body: "{}", signal: AbortSignal.timeout(3000), credentials: "omit"
+    });
+    if (!response.ok) throw new Error(`本地服务 HTTP ${response.status}${response.status === 401 || response.status === 403 ? "，请重新配对" : ""}`);
+    const result = await response.json();
+    if (result.online !== true) throw new Error("本地服务未确认在线");
+    await writeStatus({online: true, health_error: "", last_health_check: new Date().toISOString(),
+      server_started_at: result.server_started_at || "", last_live: result.last_live || null});
+  } catch (error) {
+    await writeStatus({online: false, health_error: String(error.message || error), last_health_check: new Date().toISOString()});
+  }
+}
+
+async function saveSettings(settings, confirmAccount = false) {
+  const {settings: previous = {}, queue = []} = await chrome.storage.local.get(["settings", "queue"]);
+  if (!settings || !Number.isInteger(settings.port) || settings.port < 1024 || settings.port > 65535
+      || typeof settings.account !== "string" || !settings.account.trim() || settings.account.length > 128
+      || typeof settings.project !== "string" || settings.project.length > 128
+      || typeof settings.token !== "string" || !settings.token.trim()
+      || typeof settings.enabled !== "boolean") throw new Error("请填写有效端口、配对令牌和账户标签");
+  const changed = Boolean(previous.account && previous.account !== settings.account.trim());
+  if (changed && previous.enabled) throw new Error("请先暂停采集，再更换账户标签；旧队列仍保留原标签");
+  if (!changed && settings.enabled && confirmAccount !== true) throw new Error("启用前请确认当前 ChatGPT 账户与标签一致，并关闭其他账户旧页面");
+  const next = {port: settings.port, token: settings.token.trim(), account: settings.account.trim(),
+    project: settings.project.trim(), enabled: changed ? false : Boolean(settings.enabled),
+    capture_epoch: changed || !previous.capture_epoch ? crypto.randomUUID() : previous.capture_epoch};
+  await chrome.storage.local.set({settings: next});
+  await writeStatus({queue: queue.length, capture_blocked: changed ? "账户标签已更换，采集保持暂停；确认目标账户后启用并刷新聊天页" : ""});
+  return {ok: true, enabled: next.enabled, account_changed: changed, queued: queue.length};
+}
+
 async function enqueue(payload) {
   if (!payload || payload.source !== "chatgpt" || !Array.isArray(payload.messages)
       || !payload.conversation_id || !payload.account || payload.messages.length > 500) {
     throw new Error("无效的归档消息");
+  }
+  const {settings = {}} = await chrome.storage.local.get("settings");
+  if (!settings.enabled) return {ok: false, error: "采集已暂停；页面内容未加入队列"};
+  if (payload.account !== settings.account || (settings.capture_epoch && payload.capture_epoch !== settings.capture_epoch)) {
+    await writeStatus({capture_blocked: "页面仍使用旧账户标签；确认账户后刷新目标聊天页"});
+    return {ok: false, error: "账户标签已变化，请刷新目标账户聊天页后重试"};
   }
   if (size(payload) > MAX_PAYLOAD_BYTES) throw new Error("单次消息超过 4 MB；请使用官方导出补齐");
   const {queue = []} = await chrome.storage.local.get("queue");
@@ -51,13 +96,16 @@ async function enqueue(payload) {
     return {ok: false, error: "queue_full"};
   }
   await chrome.storage.local.set({queue: next});
-  await writeStatus({queue: next.length, last_capture: new Date().toISOString()});
+  await writeStatus({queue: next.length, last_capture: new Date().toISOString(), capture_blocked: "",
+    last_page: {account: payload.account, conversation_id: payload.conversation_id,
+      rendered_messages: Number(payload.metadata?.rendered_messages || payload.messages.length),
+      fallback_message_ids: Boolean(payload.metadata?.fallback_message_ids)}});
   return {ok: true, queued: true};
 }
 
-async function flush(force = false) {
+async function flush(force = false, allowPaused = false) {
   const {settings = {}, queue = [], status = {}} = await chrome.storage.local.get(["settings", "queue", "status"]);
-  if (!settings.enabled || !settings.token) return;
+  if ((!settings.enabled && !allowPaused) || !settings.token) return;
   let completed = 0;
   let messages = Number(status.captured_messages || 0);
   while (queue.length && completed < 5) {
@@ -104,7 +152,7 @@ async function resume(project, task = "") {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, reply) => {
-  if (!message || !["capture", "status", "retry", "resume"].includes(message.type)) return false;
+  if (!message || !["capture", "status", "retry", "resume", "save-settings", "pause"].includes(message.type)) return false;
   serialize(async () => {
     if (message.type === "capture") {
       const result = await enqueue(message.payload);
@@ -113,14 +161,23 @@ chrome.runtime.onMessage.addListener((message, _sender, reply) => {
     } else if (message.type === "resume") {
       reply(await resume(message.project, message.task === undefined ? "" : message.task));
     } else if (message.type === "retry") {
-      await flush(true);
+      await flush(true, true); // Explicitly send retained batches with their original account labels.
+      await probeConnection();
+      reply({ok: true});
+    } else if (message.type === "save-settings") {
+      reply(await saveSettings(message.settings, message.confirm_account));
+    } else if (message.type === "pause") {
+      const {settings = {}} = await chrome.storage.local.get("settings");
+      await chrome.storage.local.set({settings: {...settings, enabled: false}});
       reply({ok: true});
     } else {
+      await probeConnection(); // A historical successful write is never proof that the service is online now.
       const {status = {}, queue = [], settings = {}} = await chrome.storage.local.get(["status", "queue", "settings"]);
-      reply({...status, queue: queue.length, enabled: Boolean(settings.enabled), paired: Boolean(settings.token), account: settings.account || "", project: settings.project || ""});
+      const queuedAccounts = [...new Set(queue.map(item => item.payload.account))];
+      reply({...status, queue: queue.length, queued_accounts: queuedAccounts, enabled: Boolean(settings.enabled), paired: Boolean(settings.token), account: settings.account || "", project: settings.project || ""});
     }
   }).catch(async error => {
-    if (message.type !== "resume") await writeStatus({error: String(error.message || error), connected: false});
+    if (["capture", "retry"].includes(message.type)) await writeStatus({error: String(error.message || error), connected: false});
     reply({ok: false, error: String(error.message || error)});
   });
   return true;
